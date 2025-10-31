@@ -606,6 +606,7 @@ class BaseDataset(torch.utils.data.Dataset):
         resolution: Optional[Tuple[int, int]],
         network_multiplier: float,
         debug_dataset: bool,
+        sdxl: bool = False,
     ) -> None:
         super().__init__()
 
@@ -616,6 +617,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.width, self.height = (None, None) if resolution is None else resolution
         self.network_multiplier = network_multiplier
         self.debug_dataset = debug_dataset
+        self.sdxl = sdxl
 
         self.subsets: List[Union[DreamBoothSubset, FineTuningSubset]] = []
 
@@ -1463,6 +1465,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
 
+        if self.sdxl:
+            example["original_size"] = example["original_sizes_hw"].flip(1)
+            example["bucket_size"] = example["target_sizes_hw"].flip(1)
+
         if self.debug_dataset:
             example["image_keys"] = bucket[image_index : image_index + self.batch_size]
         return example
@@ -1552,8 +1558,9 @@ class DreamBoothDataset(BaseDataset):
         bucket_no_upscale: bool,
         prior_loss_weight: float,
         debug_dataset: bool,
+        sdxl: bool = False,
     ) -> None:
-        super().__init__(tokenizer, max_token_length, resolution, network_multiplier, debug_dataset)
+        super().__init__(tokenizer, max_token_length, resolution, network_multiplier, debug_dataset, sdxl=sdxl)
 
         assert resolution is not None, f"resolution is required / resolution（解像度）指定は必須です"
 
@@ -1770,8 +1777,9 @@ class FineTuningDataset(BaseDataset):
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
         debug_dataset: bool,
+        sdxl: bool = False,
     ) -> None:
-        super().__init__(tokenizer, max_token_length, resolution, network_multiplier, debug_dataset)
+        super().__init__(tokenizer, max_token_length, resolution, network_multiplier, debug_dataset, sdxl=sdxl)
 
         self.batch_size = batch_size
 

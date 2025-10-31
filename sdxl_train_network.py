@@ -32,7 +32,10 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group.verify_bucket_reso_steps(32)
 
     def load_target_model(self, args, weight_dtype, accelerator):
-        (
+        if args.use_llm_as_text_encoder:
+            logger.info("Using LLM as text encoder.")
+            # 1. load VAE and UNET from base model
+            (
             load_stable_diffusion_format,
             text_encoder1,
             text_encoder2,
@@ -40,7 +43,30 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             unet,
             logit_scale,
             ckpt_info,
-        ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
+            ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
+
+            # 2. load the LLM and Adapter
+            text_encoder = self.load_llm_and_adapter(args)
+            if text_encoder is None:
+                logger.warning("LLM and adapter not loaded. The script will likely fail.")
+                logger.warning(
+                    "Please implement `load_llm_and_adapter_placeholder` to return a valid text encoder module."
+                )
+
+            text_encoders = [text_encoder] if text_encoder is not None else []
+            model_version = "custom_llm"
+            load_stable_diffusion_format = True
+            return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder], vae, unet
+        else:
+            (
+            load_stable_diffusion_format,
+            text_encoder1,
+            text_encoder2,
+            vae,
+            unet,
+            logit_scale,
+            ckpt_info,
+            ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
 
         self.load_stable_diffusion_format = load_stable_diffusion_format
         self.logit_scale = logit_scale
@@ -80,7 +106,10 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 )
 
             text_encoders[0].to("cpu", dtype=torch.float32)  # Text Encoder doesn't work with fp16 on CPU
-            text_encoders[1].to("cpu", dtype=torch.float32)
+            if args.use_llm_as_text_encoder:
+                pass 
+            else:
+                text_encoders[1].to("cpu", dtype=torch.float32)
             clean_memory_on_device(accelerator.device)
 
             if not args.lowram:
@@ -90,9 +119,17 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         else:
             # Text Encoderから毎回出力を取得するので、GPUに乗せておく
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)
-            text_encoders[1].to(accelerator.device, dtype=weight_dtype)
+            if args.use_llm_as_text_encoder:
+                pass
+            else:
+                text_encoders[1].to(accelerator.device, dtype=weight_dtype)
 
     def get_text_cond(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype):
+        if args.use_llm_as_text_encoder: 
+            text_encoder_conds = self.get_llm_text_conditioning(
+                                    args, batch, text_encoders[0],tokenizers[0],accelerator, weight_dtype
+                                )
+            return text_encoder_conds
         if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
             input_ids1 = batch["input_ids"]
             input_ids2 = batch["input_ids2"]
@@ -154,11 +191,16 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         crop_size = batch["crop_top_lefts"]
         target_size = batch["target_sizes_hw"]
         embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
-
-        # concat embeddings
-        encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
-        vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+        if args.use_llm_as_text_encoder:
+            prompt_embeds = text_conds["prompt_embeds"]
+            pooled_prompt_embeds = text_conds["pooled_prompt_embeds"]
+            vector_embedding = torch.cat([pooled_prompt_embeds, embs], dim=1).to(weight_dtype)
+            text_embedding = prompt_embeds
+        else:
+            # concat embeddings
+            encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
+            vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+            text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
         noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
         return noise_pred

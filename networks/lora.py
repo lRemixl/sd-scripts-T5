@@ -13,7 +13,7 @@ import torch
 import re
 from library.utils import setup_logging
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
-
+from llm_adapter_lib.llm_to_sdxl_adapter import LLMToSDXLAdapter ## llm_adapter
 setup_logging()
 import logging
 
@@ -418,7 +418,7 @@ def create_network(
     network_dim: Optional[int],
     network_alpha: Optional[float],
     vae: AutoencoderKL,
-    text_encoder: Union[CLIPTextModel, List[CLIPTextModel]],
+    text_encoder: Union[torch.nn.Module, List[torch.nn.Module]], 
     unet,
     neuron_dropout: Optional[float] = None,
     **kwargs,
@@ -876,7 +876,7 @@ class LoRANetwork(torch.nn.Module):
 
     def __init__(
         self,
-        text_encoder: Union[List[CLIPTextModel], CLIPTextModel],
+        text_encoder: Union[List[torch.nn.Module], torch.nn.Module],
         unet,
         multiplier: float = 1.0,
         lora_dim: int = 4,
@@ -1015,24 +1015,50 @@ class LoRANetwork(torch.nn.Module):
                             loras.append(lora)
             return loras, skipped
 
-        text_encoders = text_encoder if type(text_encoder) == list else [text_encoder]
+        text_encoder_modules = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
-        # create LoRA for text encoder
-        # 毎回すべてのモジュールを作るのは無駄なので要検討
         self.text_encoder_loras = []
         skipped_te = []
-        for i, text_encoder in enumerate(text_encoders):
-            if len(text_encoders) > 1:
-                index = i + 1
-                logger.info(f"create LoRA for Text Encoder {index}:")
-            else:
-                index = None
-                logger.info(f"create LoRA for Text Encoder:")
 
-            text_encoder_loras, skipped = create_modules(False, index, text_encoder, LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE)
-            self.text_encoder_loras.extend(text_encoder_loras)
-            skipped_te += skipped
+        for i, te_module in enumerate(text_encoder_modules):
+            is_sdxl_multi_te = len(text_encoder_modules) > 1
+            te_index = i + 1 if is_sdxl_multi_te else None
+
+            if isinstance(te_module, LLMToSDXLAdapter):
+                logger.info(f"create LoRA for Custom Text Encoder ({te_module.__class__.__name__}):")
+                prefix = self.LORA_PREFIX_TEXT_ENCODER # prefix lora_te 
+                
+                # find all linear layers in the adapter
+                loras = []
+                for name, child_module in te_module.named_modules():
+                    if isinstance(child_module, torch.nn.Linear):
+                        lora_name = f"{prefix}.{name}".replace(".", "_")
+                
+                        dim = self.lora_dim
+                        alpha = self.alpha
+                        
+                        lora = module_class(
+                            lora_name, child_module, self.multiplier, dim, alpha,
+                            dropout=dropout, rank_dropout=rank_dropout, module_dropout=module_dropout,
+                        )
+                        loras.append(lora)
+                
+                self.text_encoder_loras.extend(loras)
+                # 'skipped' is empty because we are not using block-wise logic 
+
+            elif isinstance(te_module, CLIPTextModel):
+                # logic for CLIP models
+                if is_sdxl_multi_te:
+                    logger.info(f"create LoRA for Text Encoder {te_index}:")
+                else:
+                    logger.info("create LoRA for Text Encoder:")
+
+                loras, skipped = create_modules(False, te_index, te_module, LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE)
+                self.text_encoder_loras.extend(loras)
+                skipped_te.extend(skipped)
+
         logger.info(f"create LoRA for Text Encoder: {len(self.text_encoder_loras)} modules.")
+
 
         # extend U-Net target modules if conv2d 3x3 is enabled, or load from weights
         target_modules = LoRANetwork.UNET_TARGET_REPLACE_MODULE
@@ -1043,6 +1069,7 @@ class LoRANetwork(torch.nn.Module):
         logger.info(f"create LoRA for U-Net: {len(self.unet_loras)} modules.")
 
         skipped = skipped_te + skipped_un
+        # skipped = skipped_un
         if varbose and len(skipped) > 0:
             logger.warning(
                 f"because block_lr_weight is 0 or dim (rank) is 0, {len(skipped)} LoRA modules are skipped / block_lr_weightまたはdim (rank)が0の為、次の{len(skipped)}個のLoRAモジュールはスキップされます:"

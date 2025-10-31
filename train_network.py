@@ -10,12 +10,15 @@ from multiprocessing import Value
 import toml
 
 from tqdm import tqdm
-
+from safetensors.torch import load_file
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
+from transformers import T5GemmaEncoderModel, AutoTokenizer
+from llm_adapter_lib.llm_to_sdxl_adapter import LLMToSDXLAdapter
+from llm_adapter_lib.t5gemma_text_encoder import T5GEMMATextEncoder
 
 init_ipex()
-
+ 
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
 from library import deepspeed_utils, model_util
@@ -44,12 +47,154 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+# Added args:
+# args.use_llm_as_text_encoder
+# args.llm_model_path
+# args.llm_adapter_path 
 
+
+class LLMAndAdapterTextEncoder(torch.nn.Module):
+    """
+    A wrapper holding both the LLM and adapter.
+    """
+    def __init__(self, llm_model, llm_adapter):
+        super().__init__()
+        self.llm_model = llm_model
+        self.llm_adapter = llm_adapter
+
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass from tokenized input to SDXL-compatible embeddings.
+        """
+        with torch.no_grad(): # Freeze the LLM 
+            outputs = self.llm_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            # from T5GEMMATextEncoder 
+            hidden_states = outputs.last_hidden_state.to(torch.float32)
+
+        prompt_embeds, pooled_embeds = self.llm_adapter(hidden_states, attention_mask=attention_mask)
+        
+        return prompt_embeds, pooled_embeds
 
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+        self.llm_adapter = None
+
+    def convert_state_dict_for_explicit_attention(self,old_state_dict):
+        """
+        converts state_dict using nn.MultiheadAttention to one
+        using the new ExplicitMultiheadAttention.
+        """
+        new_state_dict = {}
+        for key, value in old_state_dict.items():
+            # check for the combined Q, K, V weight tensor
+            if "in_proj_weight" in key:
+                q_w, k_w, v_w = value.chunk(3, dim=0)
+
+                # create the new keys by replacing the end of the old key
+                base_key = key.replace("in_proj_weight", "")
+                new_state_dict[base_key + "q_proj.weight"] = q_w
+                new_state_dict[base_key + "k_proj.weight"] = k_w
+                new_state_dict[base_key + "v_proj.weight"] = v_w
+
+            # check for the combined Q, K, V bias tensor
+            elif "in_proj_bias" in key:
+                # same as in_proj_weight
+                q_b, k_b, v_b = value.chunk(3, dim=0)
+
+                base_key = key.replace("in_proj_bias", "")
+                new_state_dict[base_key + "q_proj.bias"] = q_b
+                new_state_dict[base_key + "k_proj.bias"] = k_b
+                new_state_dict[base_key + "v_proj.bias"] = v_b
+            
+            else:
+                # If the key doesn't need conversion, copy it directly.
+                new_state_dict[key] = value
+            
+        return new_state_dict
+    def load_llm_and_adapter(self, args):
+        """
+        function for loading the LLM and adapter.
+        """
+        logger.info("Loading LLM and adapter.")
+
+        # LoRA will be applied to this.
+        llm_model = T5GemmaEncoderModel.from_pretrained(
+        args.llm_model_path,
+        torch_dtype=torch.bfloat16, 
+        )
+        llm_model.eval()
+        for param in llm_model.parameters():
+            param.requires_grad = False
+        ADAPTER_RESUME_PATH = args.llm_adapter_path
+
+        adapter = LLMToSDXLAdapter(
+        llm_dim=2304,
+        sdxl_seq_dim=2048,
+        sdxl_pooled_dim=1280,
+        max_input_len=512,
+        target_seq_len=308,
+        n_wide_blocks=3,
+        n_narrow_blocks=3,
+        num_heads=16,
+        dropout=0
+        )
+        logger.info(f"Loading old format state_dict from {ADAPTER_RESUME_PATH}")
+        old_state = load_file(ADAPTER_RESUME_PATH, device="cpu")
+        
+        logger.info("Converting old state_dict to the new explicit attention format...")
+        new_state = self.convert_state_dict_for_explicit_attention(old_state) 
+
+
+        adapter.load_state_dict(new_state)
+
+        text_encoder = LLMAndAdapterTextEncoder(llm_model, adapter)
+        logger.info("Successfully loaded LLM and initialized adapter.")
+        return text_encoder
+    
+    def load_llm_tokenizer(self, args):
+        """
+        function for loading LLM's tokenizer
+        """
+        logger.info(f"Loading LLM tokenizer from {args.llm_model_path}.")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+        args.llm_model_path,
+        trust_remote_code=True
+        )
+
+        return tokenizer
+    
+    def get_llm_text_conditioning(self, args, batch, text_encoder, tokenizer, accelerator, weight_dtype):
+        """
+        function for getting text conditioning from LLM.
+        """
+        # Take captions from batch pass through the LLM and adapter, and return the embeddings
+        captions = batch.get("captions")
+        if captions is None:
+         raise ValueError("Batch does not contain 'captions'.")
+        captions_with_eos = [caption + "<eos>" for caption in captions] # t5gemma_text_encoder uses <eos> 
+         # from t5gemma_text_encoder
+        tokenized_input = tokenizer(
+            captions_with_eos,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=512, 
+            truncation=True,
+        )
+        input_ids = tokenized_input.input_ids.to(accelerator.device)
+        attention_mask = tokenized_input.attention_mask.to(accelerator.device)
+        prompt_embeds, pooled_embeds = text_encoder(input_ids, attention_mask)
+
+        return {
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_embeds
+        }
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -121,17 +266,53 @@ class NetworkTrainer:
         input_ids = batch["input_ids"].to(accelerator.device)
         encoder_hidden_states = train_util.get_hidden_states(args, input_ids, tokenizers[0], text_encoders[0], weight_dtype)
         return encoder_hidden_states
-
+    
     def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype):
-        noise_pred = unet(noisy_latents, timesteps, text_conds).sample
-        return noise_pred
+        if args.use_llm_as_text_encoder:
+            # this isn't isn't used since sdxl_train_network.py has it's own call_unet method
+            prompt_embeds = text_conds["prompt_embeds"]
+            pooled_prompt_embeds = text_conds["pooled_prompt_embeds"]
 
+            # create add_time_ids for SDXL from the batch data
+            add_time_ids_list = []
+            for i in range(noisy_latents.shape[0]):
+                # [original_height, original_width, top_crop, left_crop, target_height, target_width]
+                original_size_hw = tuple(batch["original_sizes_hw"][i].tolist())
+                crop_coords_top_left = tuple(batch["crop_top_lefts"][i].tolist())
+                target_size_hw = tuple(batch["target_sizes_hw"][i].tolist())
+
+                # concat to form the final vector 
+                add_time_ids = list(original_size_hw) + list(crop_coords_top_left) + list(target_size_hw)
+                add_time_ids_list.append(add_time_ids)
+
+            # convert the list of vectors into a single tensor for the unet
+            add_time_ids = torch.tensor(add_time_ids_list, dtype=weight_dtype, device=accelerator.device)
+
+            # prepare the added conditioning keyword arguments for the unet
+            added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}
+
+
+            # call the unet with the SDXL-specific arguments
+            noise_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs=added_cond_kwargs,
+            ).sample
+        else:
+            # original code
+            noise_pred = unet(noisy_latents, timesteps, text_conds).sample
+
+        return noise_pred
     def all_reduce_network(self, accelerator, network):
         for param in network.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
+        if args.use_llm_as_text_encoder:
+            logger.info("Image sampling is not supported when using a LLM as a text encoder. Skippnig it. ")
+            return
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
     def train(self, args):
@@ -151,8 +332,16 @@ class NetworkTrainer:
         set_seed(args.seed)
 
         # tokenizerは単体またはリスト、tokenizersは必ずリスト：既存のコードとの互換性のため
-        tokenizer = self.load_tokenizer(args)
-        tokenizers = tokenizer if isinstance(tokenizer, list) else [tokenizer]
+        if args.use_llm_as_text_encoder:
+            self.is_sdxl = True
+            logger.info("Using LLM as text encoder. Tokenizer will be loaded with the LLM.")
+            # Load LLM tokenizer
+            tokenizer = self.load_llm_tokenizer(args)
+            tokenizers = tokenizer if isinstance(tokenizer, list) else [tokenizer]
+
+        else:
+            tokenizer = self.load_tokenizer(args)
+            tokenizers = tokenizer if isinstance(tokenizer, list) else [tokenizer]
 
         # データセットを準備する
         if args.dataset_class is None:
@@ -195,7 +384,7 @@ class NetworkTrainer:
                     }
 
             blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizer)
-            train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+            train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group, sdxl=self.is_sdxl)
         else:
             # use arbitrary dataset class
             train_dataset_group = train_util.load_arbitrary_dataset(args, tokenizer)
@@ -231,10 +420,20 @@ class NetworkTrainer:
         vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
 
         # モデルを読み込む
-        model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
-
-        # text_encoder is List[CLIPTextModel] or CLIPTextModel
-        text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+        if args.use_llm_as_text_encoder:
+            logger.info("Using LLM as text encoder (Only works when using sdxl_train_network.py).")
+            # 1. Load VAE and UNET from base model. 
+            model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+            # 2. Load LLM and Adapter
+            if text_encoder is None:
+                logger.warning("Warning: LLM and adapter not loaded.")
+            
+            text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+            model_version = "custom_llm"
+        else:
+            # Original model loading
+            model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+            text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
@@ -282,6 +481,7 @@ class NetworkTrainer:
         )
 
         # prepare network
+        
         net_kwargs = {}
         if args.network_args is not None:
             for net_arg in args.network_args:
@@ -295,17 +495,30 @@ class NetworkTrainer:
             if "dropout" not in net_kwargs:
                 # workaround for LyCORIS (;^ω^)
                 net_kwargs["dropout"] = args.network_dropout
-
-            network = network_module.create_network(
-                1.0,
-                args.network_dim,
-                args.network_alpha,
-                vae,
-                text_encoder,
-                unet,
-                neuron_dropout=args.network_dropout,
-                **net_kwargs,
-            )
+                if args.use_llm_as_text_encoder:
+                    accelerator.print("LoRA will be trained on the T5-to-SDXL Adapter.")
+                    lora_target_text_encoder = text_encoders[0].llm_adapter
+                    network = network_module.create_network(
+                        1.0,
+                        args.network_dim,
+                        args.network_alpha,
+                        vae,
+                        lora_target_text_encoder,
+                        unet,
+                        neuron_dropout=args.network_dropout,
+                        **net_kwargs,
+                        )
+                else:    
+                    network = network_module.create_network(
+                        1.0,
+                        args.network_dim,
+                        args.network_alpha,
+                        vae,
+                        text_encoder,
+                        unet,
+                        neuron_dropout=args.network_dropout,
+                        **net_kwargs,
+                    )
         if network is None:
             return
         network_has_multiplier = hasattr(network, "set_multiplier")
@@ -329,9 +542,14 @@ class NetworkTrainer:
 
         if args.gradient_checkpointing:
             unet.enable_gradient_checkpointing()
-            for t_enc in text_encoders:
-                t_enc.gradient_checkpointing_enable()
-            del t_enc
+            if args.use_llm_as_text_encoder:
+                logger.warning("Gradient checkpointing with LLM as text encoder is not supported.")
+                #text_encoders[0].gradient_checkpointing_enable()
+                #del text_encoders[0]
+            else:
+                for t_enc in text_encoders:
+                    t_enc.gradient_checkpointing_enable()
+                del t_enc
             network.enable_gradient_checkpointing()  # may have no effect
 
         # 学習に必要なクラスを準備する
@@ -425,10 +643,13 @@ class NetworkTrainer:
             t_enc.requires_grad_(False)
 
             # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
-            if t_enc.device.type != "cpu":
-                t_enc.to(dtype=te_weight_dtype)
-                # nn.Embedding not support FP8
-                t_enc.text_model.embeddings.to(dtype=(weight_dtype if te_weight_dtype != weight_dtype else te_weight_dtype))
+            if args.use_llm_as_text_encoder:
+                pass
+            else:
+                if t_enc.device.type != "cpu":
+                    t_enc.to(dtype=te_weight_dtype)
+                    # nn.Embedding not support FP8
+                    t_enc.text_model.embeddings.to(dtype=(weight_dtype if te_weight_dtype != weight_dtype else te_weight_dtype))
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
@@ -452,8 +673,7 @@ class NetworkTrainer:
                 if len(text_encoders) > 1:
                     text_encoder = text_encoders = [accelerator.prepare(t_enc) for t_enc in text_encoders]
                 else:
-                    text_encoder = accelerator.prepare(text_encoder)
-                    text_encoders = [text_encoder]
+                    text_encoder = accelerator.prepare(text_encoders[0])
             else:
                 pass  # if text_encoder is not trained, no need to prepare. and device and dtype are already set
 
@@ -465,12 +685,15 @@ class NetworkTrainer:
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
             unet.train()
-            for t_enc in text_encoders:
-                t_enc.train()
-
+            if args.use_llm_as_text_encoder:
+                pass
+            else:
+                for t_enc in text_encoders:
+                    t_enc.train()
+             
                 # set top parameter requires_grad = True for gradient checkpointing works
-                if train_text_encoder:
-                    t_enc.text_model.embeddings.requires_grad_(True)
+                    if train_text_encoder:
+                        t_enc.text_model.embeddings.requires_grad_(True)
 
         else:
             unet.eval()
@@ -878,7 +1101,10 @@ class NetworkTrainer:
                 os.remove(old_ckpt_file)
 
         # For --sample_at_first
-        self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+        if args.use_llm_as_text_encoder:
+            pass
+        else:
+            self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
         # training loop
         if initial_step > 0:  # only if skip_until_initial_step is specified
@@ -944,18 +1170,34 @@ class NetworkTrainer:
                     with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
                         # Get the text embedding for conditioning
                         if args.weighted_captions:
-                            text_encoder_conds = get_weighted_text_embeddings(
-                                tokenizer,
-                                text_encoder,
-                                batch["captions"],
-                                accelerator.device,
-                                args.max_token_length // 75 if args.max_token_length else 1,
-                                clip_skip=args.clip_skip,
-                            )
+                            if args.use_llm_as_text_encoder:
+                                text_encoder_conds = self.get_llm_text_conditioning(
+                                    args, batch, text_encoders[0],tokenizers[0],accelerator, weight_dtype
+                                )
+                                prompt_embeds_t = text_encoder_conds["prompt_embeds"]
+                                pooled_prompt_embeds_t = text_encoder_conds["pooled_prompt_embeds"]
+                                logger.warning("Warning: Weighted captions are not implemented when using LLM as text encoder.")
+                            else:
+                                text_encoder_conds = get_weighted_text_embeddings(
+                                    tokenizer,
+                                    text_encoder,
+                                    batch["captions"],
+                                    accelerator.device,
+                                    args.max_token_length // 75 if args.max_token_length else 1,
+                                    clip_skip=args.clip_skip,
+                                )
                         else:
-                            text_encoder_conds = self.get_text_cond(
-                                args, accelerator, batch, tokenizers, text_encoders, weight_dtype
-                            )
+                            if args.use_llm_as_text_encoder:
+                                text_encoder_conds = self.get_llm_text_conditioning(
+                                    args, batch, text_encoders[0],tokenizers[0],accelerator, weight_dtype
+                                )
+                                prompt_embeds_t = text_encoder_conds["prompt_embeds"]
+                                pooled_prompt_embeds_t = text_encoder_conds["pooled_prompt_embeds"]
+
+                            else:
+                                text_encoder_conds = self.get_text_cond(
+                                    args, accelerator, batch, tokenizers, text_encoders, weight_dtype
+                                )
 
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
@@ -967,18 +1209,45 @@ class NetworkTrainer:
                     if args.gradient_checkpointing:
                         for x in noisy_latents:
                             x.requires_grad_(True)
-                        for t in text_encoder_conds:
-                            t.requires_grad_(True)
+                        if args.use_llm_as_text_encoder:
+                            if train_text_encoder:
+                                prompt_embeds_t.requires_grad_(True)
+                                pooled_prompt_embeds_t.requires_grad_(True)
+                        else:
+                            for t in text_encoder_conds:
+                                t.requires_grad_(True)
 
                     # Predict the noise residual
+                    # add_time_ids = torch.tensor(batch["add_time_ids"], device=accelerator.device)
+                    #crops_coords_top_left = (0, 0)
+                    #original_size = tuple(batch["original_size"][0].tolist())
+                    #target_size = tuple(batch["bucket_size"][0].tolist())
+                    
+                    if args.use_llm_as_text_encoder:
+                        # Create add_time_ids for SDXL
+                        add_time_ids_list = []
+                        for i in range(latents.shape[0]):
+                            original_size = tuple(batch["original_size"][i].tolist())
+                            target_size = tuple(batch["bucket_size"][i].tolist())
+                            crops_coords_top_left = (0, 0)
+                            add_time_ids = list(original_size) + list(crops_coords_top_left) + list(target_size)
+                            add_time_ids_list.append(add_time_ids)
+                        
+                        add_time_ids = torch.tensor(add_time_ids_list, dtype=weight_dtype, device=accelerator.device)
+
+                        added_cond_kwargs = {"text_embeds": pooled_prompt_embeds_t, "time_ids": add_time_ids}
+                    else:
+                        added_cond_kwargs = {}
+
                     with accelerator.autocast():
+                        # call unet has if args.llm_to_sdxl_adapter and should handle this fine
                         noise_pred = self.call_unet(
                             args,
                             accelerator,
                             unet,
                             noisy_latents.requires_grad_(train_unet),
                             timesteps,
-                            text_encoder_conds,
+                            text_encoder_conds, 
                             batch,
                             weight_dtype,
                         )
@@ -1125,6 +1394,23 @@ def setup_parser() -> argparse.ArgumentParser:
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
 
+    parser.add_argument(
+        "--use_llm_as_text_encoder",
+        action="store_true",
+        help="Use LLM as a text encoder with an adapter.",
+    )
+    parser.add_argument(
+        "--llm_model_path",
+        type=str,
+        default=None,
+        help="Path to the LLM model for the text encoder.",
+    )
+    parser.add_argument(
+        "--llm_adapter_path",
+        type=str,
+        default=None,
+        help="Path to the LLM Adapter for the text encoder.",
+    )
     parser.add_argument(
         "--no_metadata", action="store_true", help="do not save metadata in output model / メタデータを出力先モデルに保存しない"
     )
