@@ -46,18 +46,160 @@ from library.custom_train_functions import (
     apply_masked_loss,
 )
 from library.utils import setup_logging, add_logging_arguments
-
+from safetensors.torch import load_file
+from transformers import T5GemmaEncoderModel, AutoTokenizer
+from llm_adapter_lib.llm_to_sdxl_adapter import LLMToSDXLAdapter
+from llm_adapter_lib.t5gemma_text_encoder import T5GEMMATextEncoder
 setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
 
+class LLMAndAdapterTextEncoder(torch.nn.Module):
+    """
+    A wrapper holding both the LLM and adapter.
+    """
+    def __init__(self, llm_model, llm_adapter):
+        super().__init__()
+        self.llm_model = llm_model
+        self.llm_adapter = llm_adapter
 
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass from tokenized input to SDXL-compatible embeddings.
+        """
+        with torch.no_grad(): # Freeze the LLM 
+            outputs = self.llm_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            # from T5GEMMATextEncoder 
+            hidden_states = outputs.last_hidden_state.to(torch.float32)
+
+        prompt_embeds, pooled_embeds = self.llm_adapter(hidden_states, attention_mask=attention_mask)
+        
+        return prompt_embeds, pooled_embeds
+    
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+    def convert_state_dict_for_explicit_attention(self,old_state_dict):
+        """
+        converts state_dict using nn.MultiheadAttention to one
+        using the new ExplicitMultiheadAttention.
+        """
+        new_state_dict = {}
+        for key, value in old_state_dict.items():
+            # check for the combined Q, K, V weight tensor
+            if "in_proj_weight" in key:
+                q_w, k_w, v_w = value.chunk(3, dim=0)
 
+                # create the new keys by replacing the end of the old key
+                base_key = key.replace("in_proj_weight", "")
+                new_state_dict[base_key + "q_proj.weight"] = q_w
+                new_state_dict[base_key + "k_proj.weight"] = k_w
+                new_state_dict[base_key + "v_proj.weight"] = v_w
+
+            # check for the combined Q, K, V bias tensor
+            elif "in_proj_bias" in key:
+                # same as in_proj_weight
+                q_b, k_b, v_b = value.chunk(3, dim=0)
+
+                base_key = key.replace("in_proj_bias", "")
+                new_state_dict[base_key + "q_proj.bias"] = q_b
+                new_state_dict[base_key + "k_proj.bias"] = k_b
+                new_state_dict[base_key + "v_proj.bias"] = v_b
+            
+            else:
+                # If the key doesn't need conversion, copy it directly.
+                new_state_dict[key] = value
+            
+        return new_state_dict
+    
+    def load_llm_and_adapter(self, args):
+        """
+        function for loading the LLM and adapter.
+        """
+        logger.info("Loading LLM and adapter.")
+
+        # LoRA will be applied to this.
+        llm_model = T5GemmaEncoderModel.from_pretrained(
+        args.llm_model_path,
+        torch_dtype=torch.bfloat16, 
+        )
+        llm_model.eval()
+        for param in llm_model.parameters():
+            param.requires_grad = False
+        if args.gradient_checkpointing:
+            llm_model.gradient_checkpointing_enable()
+            
+        ADAPTER_RESUME_PATH = args.llm_adapter_path
+
+        adapter = LLMToSDXLAdapter(
+        llm_dim=2304,
+        sdxl_seq_dim=2048,
+        sdxl_pooled_dim=1280,
+        max_input_len=512,
+        target_seq_len=308,
+        n_wide_blocks=3,
+        n_narrow_blocks=3,
+        num_heads=16,
+        dropout=0
+        )
+        logger.info(f"Loading old format state_dict from {ADAPTER_RESUME_PATH}")
+        old_state = load_file(ADAPTER_RESUME_PATH, device="cpu")
+        
+        logger.info("Converting old state_dict to the new explicit attention format...")
+        new_state = self.convert_state_dict_for_explicit_attention(old_state) 
+
+
+        adapter.load_state_dict(new_state)
+
+        text_encoder = LLMAndAdapterTextEncoder(llm_model, adapter)
+        logger.info("Successfully loaded LLM and initialized adapter.")
+        return text_encoder
+    
+    def load_llm_tokenizer(self, args):
+        """
+        function for loading LLM's tokenizer
+        """
+        logger.info(f"Loading LLM tokenizer from {args.llm_model_path}.")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+        args.llm_model_path,
+        trust_remote_code=True
+        )
+
+        return tokenizer
+    
+    def get_llm_text_conditioning(self, args, batch, text_encoder, tokenizer, accelerator, weight_dtype):
+        """
+        function for getting text conditioning from LLM.
+        """
+        # Take captions from batch pass through the LLM and adapter, and return the embeddings
+        captions = batch.get("captions")
+        if captions is None:
+         raise ValueError("Batch does not contain 'captions'.")
+        captions_with_eos = [caption + "<eos>" for caption in captions] # t5gemma_text_encoder uses <eos> 
+         # from t5gemma_text_encoder
+        tokenized_input = tokenizer(
+            captions_with_eos,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=512, 
+            truncation=True,
+        )
+        input_ids = tokenized_input.input_ids.to(accelerator.device)
+        attention_mask = tokenized_input.attention_mask.to(accelerator.device)
+        prompt_embeds, pooled_embeds = text_encoder(input_ids, attention_mask)
+
+        return {
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_embeds
+        }
+    
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
@@ -235,6 +377,9 @@ class NetworkTrainer:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
+        if args.use_llm_as_text_encoder:
+            logger.warning("Sample images not supported when training LLM adapter")
+            return 
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizers[0], text_encoder, unet)
 
     # region SD/SDXL
@@ -279,8 +424,11 @@ class NetworkTrainer:
         if args.gradient_checkpointing:
             for x in noisy_latents:
                 x.requires_grad_(True)
-            for t in text_encoder_conds:
-                t.requires_grad_(True)
+            if args.use_llm_as_text_encoder:
+                pass
+            else:
+                for t in text_encoder_conds:
+                    t.requires_grad_(True)
 
         # Predict the noise residual
         with torch.set_grad_enabled(is_train), accelerator.autocast():
@@ -371,6 +519,7 @@ class NetworkTrainer:
         self,
         batch,
         text_encoders,
+        tokenizers,
         unet,
         network,
         vae,
@@ -388,6 +537,7 @@ class NetworkTrainer:
         """
         Process a batch for the network
         """
+        # text_encoders when args.use_llm_as_text_encoder is of type LLMAndAdapterTextEncoder
         with torch.no_grad():
             if "latents" in batch and batch["latents"] is not None:
                 latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
@@ -422,47 +572,71 @@ class NetworkTrainer:
             # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
             with torch.set_grad_enabled(is_train and train_text_encoder), accelerator.autocast():
                 # Get the text embedding for conditioning
-                if args.weighted_captions:
-                    input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
-                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
-                        tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                        input_ids_list,
-                        weights_list,
-                    )
+                if args.use_llm_as_text_encoder: 
+                    if args.weighted_captions:
+                        logger.warning("Warning: Weighted captions are not implemented when using LLM as text encoder.")
+                    text_encoder_conds = self.get_llm_text_conditioning(
+                                    args, batch, text_encoders[0],tokenizers[0],accelerator, weight_dtype
+                                )
+                    prompt_embeds_t = text_encoder_conds["prompt_embeds"]
+                    pooled_prompt_embeds_t = text_encoder_conds["pooled_prompt_embeds"]
+                    
                 else:
-                    input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
-                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
-                        tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                        input_ids,
-                    )
-                if args.full_fp16:
-                    encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
-
-            # if text_encoder_conds is not cached, use encoded_text_encoder_conds
-            if len(text_encoder_conds) == 0:
-                text_encoder_conds = encoded_text_encoder_conds
+                    if args.weighted_captions:
+                        input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids_list,
+                            weights_list,
+                        )
+                    else:
+                        input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids,
+                        )
+                    if args.full_fp16:
+                        encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+            if args.use_llm_as_text_encoder:
+                noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
+                    args,
+                    accelerator,
+                    noise_scheduler,
+                    latents,
+                    batch,
+                    text_encoder_conds,
+                    unet,
+                    network,
+                    weight_dtype,
+                    train_unet,
+                    is_train=is_train,
+                )
             else:
-                # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
-                for i in range(len(encoded_text_encoder_conds)):
-                    if encoded_text_encoder_conds[i] is not None:
-                        text_encoder_conds[i] = encoded_text_encoder_conds[i]
+                # if text_encoder_conds is not cached, use encoded_text_encoder_conds
+                if len(text_encoder_conds) == 0:
+                    text_encoder_conds = encoded_text_encoder_conds
+                else:
+                    # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
+                    for i in range(len(encoded_text_encoder_conds)):
+                        if encoded_text_encoder_conds[i] is not None:
+                            text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
-        # sample noise, call unet, get target
-        noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
-            args,
-            accelerator,
-            noise_scheduler,
-            latents,
-            batch,
-            text_encoder_conds,
-            unet,
-            network,
-            weight_dtype,
-            train_unet,
-            is_train=is_train,
-        )
+            # sample noise, call unet, get target
+                noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
+                    args,
+                    accelerator,
+                    noise_scheduler,
+                    latents,
+                    batch,
+                    text_encoder_conds,
+                    unet,
+                    network,
+                    weight_dtype,
+                    train_unet,
+                    is_train=is_train,
+                )
 
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
@@ -506,7 +680,12 @@ class NetworkTrainer:
 
         tokenize_strategy = self.get_tokenize_strategy(args)
         strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
-        tokenizers = self.get_tokenizers(tokenize_strategy)  # will be removed after sample_image is refactored
+        if args.use_llm_as_text_encoder:
+            logger.info("Using LLM as text encoder. Tokenizer will be loaded with the LLM.")
+            tokenizer = self.load_llm_tokenizer(args)
+            tokenizers = tokenizer if isinstance(tokenizer, list) else [tokenizer]
+        else:
+            tokenizers = self.get_tokenizers(tokenize_strategy)  # will be removed after sample_image is refactored
 
         # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
         latents_caching_strategy = self.get_latents_caching_strategy(args)
@@ -599,14 +778,18 @@ class NetworkTrainer:
         vae_dtype = (torch.float32 if args.no_half_vae else weight_dtype) if self.cast_vae(args) else None
 
         # load target models: unet may be None for lazy loading
-        model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+        if args.use_llm_as_text_encoder:
+            model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+            text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+            model_version = "custom_llm"
+        else:
+            model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+            # text_encoder is List[CLIPTextModel] or CLIPTextModel
+            text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+            
         if vae_dtype is None:
-            vae_dtype = vae.dtype
-            logger.info(f"vae_dtype is set to {vae_dtype} by the model since cast_vae() is false")
-
-        # text_encoder is List[CLIPTextModel] or CLIPTextModel
-        text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
-
+                vae_dtype = vae.dtype
+                logger.info(f"vae_dtype is set to {vae_dtype} by the model since cast_vae() is false")
         # prepare dataset for latents caching if needed
         if cache_latents:
             vae.to(accelerator.device, dtype=vae_dtype)
@@ -630,6 +813,8 @@ class NetworkTrainer:
         text_encoder_outputs_caching_strategy = self.get_text_encoder_outputs_caching_strategy(args)
         if text_encoder_outputs_caching_strategy is not None:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy)
+            if args.use_llm_as_text_encoder:
+                logger.warn("Caching text encoder not supported with LLM as text encoder")
         self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, train_dataset_group, weight_dtype)
         if val_dataset_group is not None:
             self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, val_dataset_group, weight_dtype)
@@ -674,13 +859,17 @@ class NetworkTrainer:
             if "dropout" not in net_kwargs:
                 # workaround for LyCORIS (;^ω^)
                 net_kwargs["dropout"] = args.network_dropout
-
+            lora_target_text_encoder = text_encoder 
+            
+            if args.use_llm_as_text_encoder:
+                lora_target_text_encoder = text_encoders[0].llm_adapter
+                
             network = network_module.create_network(
                 1.0,
                 args.network_dim,
                 args.network_alpha,
                 vae,
-                text_encoder,
+                lora_target_text_encoder,
                 unet,
                 neuron_dropout=args.network_dropout,
                 **net_kwargs,
@@ -706,6 +895,15 @@ class NetworkTrainer:
         # apply network to unet and text_encoder
         train_unet = not args.network_train_text_encoder_only
         train_text_encoder = self.is_train_text_encoder(args)
+        
+        if args.use_llm_as_text_encoder and train_text_encoder:
+            for name, param in text_encoders[0].llm_adapter.named_parameters():
+                param.requires_grad_(True)
+
+            trainable_params = sum(p.numel() for p in text_encoders[0].llm_adapter.parameters() if p.requires_grad)
+            logger.info(f"Trainable (adapter) params: {trainable_params}")
+
+        
         network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
 
         if args.network_weights is not None:
@@ -717,12 +915,14 @@ class NetworkTrainer:
             if args.cpu_offload_checkpointing:
                 unet.enable_gradient_checkpointing(cpu_offload=True)
             else:
-                unet.enable_gradient_checkpointing()
-
+                unet.enable_gradient_checkpointing()                
             for t_enc, flag in zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders)):
                 if flag:
-                    if t_enc.supports_gradient_checkpointing:
-                        t_enc.gradient_checkpointing_enable()
+                    if isinstance(t_enc, LLMAndAdapterTextEncoder):
+                        pass
+                    else:
+                        if t_enc.supports_gradient_checkpointing:
+                            t_enc.gradient_checkpointing_enable()
             del t_enc
             network.enable_gradient_checkpointing()  # may have no effect
 
@@ -850,15 +1050,18 @@ class NetworkTrainer:
         if self.cast_unet(args):
             unet.to(dtype=unet_weight_dtype)
         for i, t_enc in enumerate(text_encoders):
-            t_enc.requires_grad_(False)
+            if args.use_llm_as_text_encoder:
+                pass
+            else:
+                t_enc.requires_grad_(False)
 
-            # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
-            if t_enc.device.type != "cpu" and self.cast_text_encoder(args):
-                t_enc.to(dtype=te_weight_dtype)
+                # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
+                if t_enc.device.type != "cpu" and self.cast_text_encoder(args):
+                    t_enc.to(dtype=te_weight_dtype)
 
-                # nn.Embedding not support FP8
-                if te_weight_dtype != weight_dtype:
-                    self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
+                    # nn.Embedding not support FP8
+                    if te_weight_dtype != weight_dtype:
+                        self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
@@ -902,16 +1105,22 @@ class NetworkTrainer:
             # according to TI example in Diffusers, train is required
             unet.train()
             for i, (t_enc, frag) in enumerate(zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders))):
-                t_enc.train()
-
-                # set top parameter requires_grad = True for gradient checkpointing works
-                if frag:
-                    self.prepare_text_encoder_grad_ckpt_workaround(i, t_enc)
+                if args.use_llm_as_text_encoder:
+                    t_enc.llm_adapter.train()
+                else:
+                    t_enc.train()
+                
+                    # set top parameter requires_grad = True for gradient checkpointing works
+                    if frag:
+                        self.prepare_text_encoder_grad_ckpt_workaround(i, t_enc)
 
         else:
             unet.eval()
             for t_enc in text_encoders:
-                t_enc.eval()
+                if args.use_llm_as_text_encoder:
+                    t_enc.llm_adapter.eval()
+                else:
+                    t_enc.eval()
 
         del t_enc
 
@@ -1345,12 +1554,15 @@ class NetworkTrainer:
 
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
-        for i, t_enc in enumerate(text_encoders):
-            params_itr = t_enc.parameters()
-            params_itr.__next__()  # skip the first parameter
-            params_itr.__next__()  # skip the second parameter. because CLIP first two parameters are embeddings
-            param_3rd = params_itr.__next__()
-            logger.info(f"text_encoder [{i}] dtype: {param_3rd.dtype}, device: {t_enc.device}")
+        if args.use_llm_as_text_encoder:
+            pass
+        else:
+            for i, t_enc in enumerate(text_encoders):
+                params_itr = t_enc.parameters()
+                params_itr.__next__()  # skip the first parameter
+                params_itr.__next__()  # skip the second parameter. because CLIP first two parameters are embeddings
+                param_3rd = params_itr.__next__()
+                logger.info(f"text_encoder [{i}] dtype: {param_3rd.dtype}, device: {t_enc.device}")
 
         clean_memory_on_device(accelerator.device)
 
@@ -1423,10 +1635,10 @@ class NetworkTrainer:
 
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
-
                     loss = self.process_batch(
                         batch,
                         text_encoders,
+                        tokenizers,
                         unet,
                         network,
                         vae,
@@ -1558,6 +1770,7 @@ class NetworkTrainer:
                             loss = self.process_batch(
                                 batch,
                                 text_encoders,
+                                tokenizers,
                                 unet,
                                 network,
                                 vae,
@@ -1636,6 +1849,7 @@ class NetworkTrainer:
                         loss = self.process_batch(
                             batch,
                             text_encoders,
+                            tokenizers,
                             unet,
                             network,
                             vae,
@@ -1742,7 +1956,25 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
-
+    
+    parser.add_argument(
+        "--use_llm_as_text_encoder",
+        action="store_true",
+        help="Use LLM as a text encoder with an adapter.",
+    )
+    parser.add_argument(
+        "--llm_model_path",
+        type=str,
+        default=None,
+        help="Path to the LLM model for the text encoder.",
+    )
+    parser.add_argument(
+        "--llm_adapter_path",
+        type=str,
+        default=None,
+        help="Path to the LLM Adapter for the text encoder.",
+    )
+    
     parser.add_argument(
         "--cpu_offload_checkpointing",
         action="store_true",

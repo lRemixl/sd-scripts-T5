@@ -13,7 +13,7 @@ from library.utils import setup_logging
 
 setup_logging()
 import logging
-
+import gc
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +45,7 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             val_dataset_group.verify_bucket_reso_steps(32)
 
     def load_target_model(self, args, weight_dtype, accelerator):
+        
         (
             load_stable_diffusion_format,
             text_encoder1,
@@ -58,12 +59,23 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         self.load_stable_diffusion_format = load_stable_diffusion_format
         self.logit_scale = logit_scale
         self.ckpt_info = ckpt_info
-
+            
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
-
+            
+        if args.use_llm_as_text_encoder:
+            del text_encoder1
+            del text_encoder2
+            gc.collect()
+            text_encoder = self.load_llm_and_adapter(args)
+            if text_encoder is None:
+                logger.warning("LLM and adapter not loaded. The script will likely fail.")
+            text_encoders = [text_encoder] if text_encoder is not None else []
+            model_version = "custom_llm"
+            return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, text_encoders, vae, unet
+        
         return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
 
     def get_tokenize_strategy(self, args):
@@ -121,9 +133,14 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 vae.to(org_vae_device)
                 unet.to(org_unet_device)
         else:
+            if args.use_llm_as_text_encoder:
+                text_encoders[0].to(accelerator.device, dtype=weight_dtype)
+                #text_encoders[0].llm_model.to(accelerator.device, dtype=weight_dtype)
+                #text_encoders[0].llm_adapter.to(accelerator.device, dtype=weight_dtype)
+            else:
             # Text Encoderから毎回出力を取得するので、GPUに乗せておく
-            text_encoders[0].to(accelerator.device, dtype=weight_dtype)
-            text_encoders[1].to(accelerator.device, dtype=weight_dtype)
+                text_encoders[0].to(accelerator.device, dtype=weight_dtype)
+                text_encoders[1].to(accelerator.device, dtype=weight_dtype)
 
     def get_text_cond(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype):
         if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
@@ -198,12 +215,17 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         crop_size = batch["crop_top_lefts"]
         target_size = batch["target_sizes_hw"]
         embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
-
-        # concat embeddings
-        encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
-        vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
-
+        if args.use_llm_as_text_encoder:
+            prompt_embeds = text_conds["prompt_embeds"]
+            pooled_prompt_embeds = text_conds["pooled_prompt_embeds"]
+            vector_embedding = torch.cat([pooled_prompt_embeds, embs], dim=1).to(weight_dtype)
+            text_embedding = prompt_embeds
+        else:
+            # concat embeddings
+            encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
+            vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+            text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+    
         if indices is not None and len(indices) > 0:
             noisy_latents = noisy_latents[indices]
             timesteps = timesteps[indices]
