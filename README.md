@@ -3,6 +3,15 @@ This repository contains training, generation and utility scripts for Stable Dif
 [__Change History__](#change-history) is moved to the bottom of the page. 
 更新履歴は[ページ末尾](#change-history)に移しました。
 
+Latest update: 2025-10-31 
+
+Added support for training LoRAs using T5 adapter [found here](https://huggingface.co/Minthy/RouWei-Gemma/)
+Use the args:
+- -- use_llm_as_text_encoder 
+- -- llm_model_path [path to llm text encoder]
+- -- llm_adapter_path [path to the adapter]
+Use sdxl_train_network.py like usual 
+
 Latest update: 2025-03-21 (Version 0.9.1)
 
 [日本語版READMEはこちら](./README-ja.md)
