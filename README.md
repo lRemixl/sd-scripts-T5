@@ -5,14 +5,18 @@ This repository contains training, generation and utility scripts for Stable Dif
 
 Latest update: 2025-10-31 
 
-Added support for training LoRAs using T5 adapter [found here](https://huggingface.co/Minthy/RouWei-Gemma/)
+Added support for training LoRAs using **T5 adapter** [found here](https://huggingface.co/Minthy/RouWei-Gemma/)
+
+LoRAs should be used along-side [custom nodes](https://github.com/NeuroSenko/ComfyUI_LLM_SDXL_Adapter/)
+
+**Haven't yet implemented gradient checkpointing.** 
 
 Use the args:
 - -- use_llm_as_text_encoder 
 - -- llm_model_path [path to llm text encoder]
 - -- llm_adapter_path [path to the adapter]
 
-Use sdxl_train_network.py like usual 
+Then use sdxl_train_network.py like usual 
 
 Latest update: 2025-03-21 (Version 0.9.1)
 
