@@ -1,10 +1,12 @@
 This repository contains training, generation and utility scripts for Stable Diffusion.
 ## T5 Adapter Training
+
+### **IMPORTANT** : Only LoRAs are supported currently 
+
 Latest update: 2025-10-31:
 - Implemented gradient checkpointing.
 - Switched to sd3 branch of sd-scripts
 ### First Release
-
 Added support for training LoRAs using **T5 adapter** [found here](https://huggingface.co/Minthy/RouWei-Gemma/)
 
 LoRAs should be used along-side [custom nodes](https://github.com/NeuroSenko/ComfyUI_LLM_SDXL_Adapter/)
