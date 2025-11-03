@@ -7,9 +7,9 @@ Latest update: 2025-10-31:
 - Implemented gradient checkpointing.
 - Switched to sd3 branch of sd-scripts
 ### First Release
-Added support for training LoRAs using **T5 adapter** [found here](https://huggingface.co/Minthy/RouWei-Gemma/)
+Added support for training LoRAs using **T5 adapter** [found here](https://huggingface.co/Minthy/Rouwei-T5Gemma-adapter_v0.2/)
 
-LoRAs should be used along-side [custom nodes](https://github.com/NeuroSenko/ComfyUI_LLM_SDXL_Adapter/)
+LoRAs should be used along-side [custom nodes](https://github.com/NeuroSenko/ComfyUI_LLM_SDXL_Adapter/) or [Fork](https://github.com/lRemixl/ComfyUI_LLM_SDXL_Adapter/tree/dev-lora)  
 
 
 
