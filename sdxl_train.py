@@ -16,13 +16,15 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from accelerate.utils import set_seed
-from diffusers import DDPMScheduler
+from diffusers import DDPMScheduler # type: ignore
+from safetensors.torch import load_file
+from transformers import Qwen3VLForConditionalGeneration, T5GemmaEncoderModel, AutoTokenizer
 from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec
 
 import library.train_util as train_util
 
 from library.utils import setup_logging, add_logging_arguments
-
+from scripts.llm_to_sdxl_adapter import LLMoSDXLAdapter
 setup_logging()
 import logging
 
@@ -95,6 +97,171 @@ def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
 
     train_util.append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names)
 
+class LLMAndAdapterTextEncoder(torch.nn.Module):
+    """
+    A wrapper holding both the LLM and adapter.
+    """
+    def __init__(self, llm_model, llm_adapter, is_qwen):
+        super().__init__()
+        self.llm_model = llm_model
+        self.llm_adapter = llm_adapter
+        self.is_qwen = is_qwen
+
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass from tokenized input to SDXL-compatible embeddings.
+        """
+        if self.is_qwen:
+            with torch.no_grad(): # Freeze the LLM 
+                outputs = self.llm_model.language_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+            # from T5GEMMATextEncoder 
+            hidden_states = outputs.last_hidden_state.to(torch.float32)
+        else:
+            with torch.no_grad(): # Freeze the LLM 
+                outputs = self.llm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+            # from T5GEMMATextEncoder 
+            hidden_states = outputs.last_hidden_state.to(torch.float32)
+        adapter_outputs = self.llm_adapter(hidden_states, attention_mask=attention_mask)
+        prompt_embeds = adapter_outputs['text_embeds']
+        pooled_embeds = adapter_outputs['pooled_text_embeds']
+
+        # prompt_embeds, pooled_embeds = self.llm_adapter(hidden_states, attention_mask=attention_mask)
+        
+        return prompt_embeds, pooled_embeds
+    
+def load_llm_and_adapter(args):
+        """
+        function for loading the LLM and adapter.
+        """
+        logger.info("Loading LLM and adapter.")
+        
+        
+        # Only Load the text encoder
+        if args.use_qwen3VL_as_text_encoder:
+            llm_model = Qwen3VLForConditionalGeneration.from_pretrained(
+             args.llm_model_path,
+             torch_dtype=torch.bfloat16,
+             trust_remote_code=True
+            )
+            
+            
+            print(f"Loaded Qwen-3-VL from: {args.llm_model_path}")
+        else:
+            llm_model = T5GemmaEncoderModel.from_pretrained(
+            args.llm_model_path,
+            torch_dtype=torch.bfloat16, 
+            )
+            print(f"Loaded T5Gemma from: {args.llm_model_path}")
+        llm_model.requires_grad_(False)
+        llm_model.eval()
+        for param in llm_model.parameters():
+            param.requires_grad = False
+        if args.gradient_checkpointing:
+            llm_model.gradient_checkpointing_enable()
+            
+        ADAPTER_RESUME_PATH = args.llm_adapter_path
+       
+        llm_dim_input = 2304
+        if args.use_qwen3VL_as_text_encoder:
+            llm_dim_input = 2560
+         # LoRA will be applied to this.
+        adapter = LLMoSDXLAdapter(
+        llm_dim=llm_dim_input,
+        sdxl_seq_dim=2048,
+        sdxl_pooled_dim=1280,
+        max_input_len=512,
+        target_seq_len=308,
+        n_wide_blocks=3,
+        n_narrow_blocks=3,
+        num_heads=16,
+        dropout=0.05
+        )
+        logger.info(f"Loading state_dict from {ADAPTER_RESUME_PATH}")
+        state_dict = load_file(ADAPTER_RESUME_PATH, device="cpu")
+        
+        adapter.load_state_dict(state_dict)
+        is_qwen = True if args.use_qwen3VL_as_text_encoder else False
+        adapter.requires_grad_(True)
+        text_encoder = LLMAndAdapterTextEncoder(llm_model, adapter,is_qwen)
+        logger.info("Successfully loaded LLM and initialized adapter.")
+        return text_encoder
+    
+def load_llm_tokenizer(args):
+        """
+        function for loading LLM's tokenizer
+        """
+        logger.info(f"Loading LLM tokenizer from {args.llm_model_path}.")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+        args.llm_model_path,
+        trust_remote_code=True
+        )
+
+        return tokenizer
+# text_encoder should be of type LLMAndAdapterTextEncoder
+def get_llm_text_conditioning(args, batch, text_encoder, tokenizer, accelerator, weight_dtype):
+        """
+        function for getting text conditioning from LLM.
+        """
+        # Take captions from batch pass through the LLM and adapter, and return the embeddings
+        captions = batch.get("captions")
+        if captions is None:
+         raise ValueError("Batch does not contain 'captions'.")
+        captions_with_eos = [caption + tokenizer.eos_token for caption in captions] # t5gemma_text_encoder uses <eos> 
+         # from t5gemma_text_encoder
+        tokenized_input = tokenizer(
+            captions_with_eos,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=512, 
+            truncation=True,
+        )
+        input_ids = tokenized_input.input_ids.to(accelerator.device)
+        attention_mask = tokenized_input.attention_mask.to(accelerator.device)
+        prompt_embeds, pooled_embeds = text_encoder(input_ids, attention_mask)
+
+        return {
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_embeds
+        }
+def save_llm_adapter(Aargs, module: torch.nn.Module, out_dir: str, tag: str, use_safetensors: bool = True):
+    use_safetensors1 = True
+    os.makedirs(out_dir, exist_ok=True)
+    adapter = module
+    try:
+        # unwrap if wrapped by DDP / Accelerate
+        from accelerate.utils import is_deepspeed_available
+        adapter = adapter.module if hasattr(adapter, "module") else adapter
+    except Exception:
+        pass
+
+    state = {k: v.detach().cpu() for k, v in adapter.state_dict().items()}
+    fname = f"llm_adapter-{tag}.safetensors" if use_safetensors1 else f"llm_adapter-{tag}.bin"
+
+    if use_safetensors1:
+        from safetensors.torch import save_file
+        save_file(state, os.path.join(out_dir, fname))
+    else:
+        torch.save(state, os.path.join(out_dir, fname))
+
+    # optional: write a small sidecar so inference knows what to load
+    meta = {
+        "llm_model_path": Aargs.llm_model_path,
+        "llm_is_qwen": getattr(Aargs, "use_qwen3VL_as_text_encoder", False),
+        "sdxl_seq_dim": 2048,
+        "sdxl_pooled_dim": 1280,
+        "target_seq_len": 308,
+    }
+    with open(os.path.join(out_dir, f"llm_adapter-{tag}.json"), "w", encoding="utf-8") as f:
+        import json; json.dump(meta, f, ensure_ascii=False, indent=2)
 
 def train(args):
     train_util.verify_training_args(args)
@@ -284,6 +451,7 @@ def train(args):
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
     train_unet = args.learning_rate != 0
+    train_unet = False # Added 
     train_text_encoder1 = False
     train_text_encoder2 = False
 
@@ -350,11 +518,18 @@ def train(args):
             params_to_optimize.append({"params": list(unet.parameters()), "lr": args.learning_rate})
         else:
             params_to_optimize.extend(get_block_params_to_optimize(unet, block_lrs))
+    if args.use_llm_as_text_encoder:
+        del text_encoder1
+        del text_encoder2
+        a_text_encoder = load_llm_and_adapter(args)
+        a_tokenizer = load_llm_tokenizer(args)
+        training_models.append(a_text_encoder.llm_adapter)
+        params_to_optimize.append({"params": list(a_text_encoder.llm_adapter.parameters()), "lr": args.learning_rate})
 
-    if train_text_encoder1:
+    elif train_text_encoder1:
         training_models.append(text_encoder1)
         params_to_optimize.append({"params": list(text_encoder1.parameters()), "lr": args.learning_rate_te1 or args.learning_rate})
-    if train_text_encoder2:
+    elif train_text_encoder2:
         training_models.append(text_encoder2)
         params_to_optimize.append({"params": list(text_encoder2.parameters()), "lr": args.learning_rate_te2 or args.learning_rate})
 
@@ -461,21 +636,27 @@ def train(args):
         ), "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
         accelerator.print("enable full fp16 training.")
         unet.to(weight_dtype)
-        text_encoder1.to(weight_dtype)
-        text_encoder2.to(weight_dtype)
+        if not args.use_llm_as_text_encoder:
+
+            text_encoder1.to(weight_dtype)
+            text_encoder2.to(weight_dtype)
     elif args.full_bf16:
         assert (
             args.mixed_precision == "bf16"
         ), "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
         accelerator.print("enable full bf16 training.")
         unet.to(weight_dtype)
-        text_encoder1.to(weight_dtype)
-        text_encoder2.to(weight_dtype)
+        if not args.use_llm_as_text_encoder:
+
+            text_encoder1.to(weight_dtype)
+            text_encoder2.to(weight_dtype)
 
     # freeze last layer and final_layer_norm in te1 since we use the output of the penultimate layer
     if train_text_encoder1:
-        text_encoder1.text_model.encoder.layers[-1].requires_grad_(False)
-        text_encoder1.text_model.final_layer_norm.requires_grad_(False)
+        if not args.use_llm_as_text_encoder:
+
+            text_encoder1.text_model.encoder.layers[-1].requires_grad_(False)
+            text_encoder1.text_model.final_layer_norm.requires_grad_(False)
 
     if args.deepspeed:
         ds_model = deepspeed_utils.prepare_deepspeed_model(
@@ -494,10 +675,12 @@ def train(args):
         # acceleratorがなんかよろしくやってくれるらしい
         if train_unet:
             unet = accelerator.prepare(unet)
-        if train_text_encoder1:
-            text_encoder1 = accelerator.prepare(text_encoder1)
-        if train_text_encoder2:
-            text_encoder2 = accelerator.prepare(text_encoder2)
+        if not args.use_llm_as_text_encoder:
+
+            if train_text_encoder1:
+                text_encoder1 = accelerator.prepare(text_encoder1)
+            if train_text_encoder2:
+                text_encoder2 = accelerator.prepare(text_encoder2)
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     # TextEncoderの出力をキャッシュするときにはCPUへ移動する
@@ -508,8 +691,15 @@ def train(args):
         clean_memory_on_device(accelerator.device)
     else:
         # make sure Text Encoders are on GPU
-        text_encoder1.to(accelerator.device)
-        text_encoder2.to(accelerator.device)
+        if not args.use_llm_as_text_encoder:
+            text_encoder1.to(accelerator.device)
+            text_encoder2.to(accelerator.device)
+        else:
+            a_text_encoder.llm_adapter.to(accelerator.device)
+            a_text_encoder.llm_model.to(accelerator.device)
+            a_text_encoder.llm_adapter = accelerator.prepare(a_text_encoder.llm_adapter)
+
+            # a_tokenizer.to(accelerator.device)
 
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
     if args.full_fp16:
@@ -615,9 +805,10 @@ def train(args):
         )
 
     # For --sample_at_first
-    sdxl_train_util.sample_images(
-        accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, [text_encoder1, text_encoder2], unet
-    )
+    if not args.use_llm_as_text_encoder:
+        sdxl_train_util.sample_images(
+            accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, [text_encoder1, text_encoder2], unet
+        )
     if len(accelerator.trackers) > 0:
         # log empty object to commit the sample images to wandb
         accelerator.log({}, step=0)
@@ -659,40 +850,51 @@ def train(args):
                     pool2 = pool2.to(accelerator.device, dtype=weight_dtype)
                 else:
                     input_ids1, input_ids2 = batch["input_ids_list"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
+                    enable_grads = args.train_text_encoder or args.use_llm_as_text_encoder
+
+                    with torch.set_grad_enabled(enable_grads):
                         # Get the text embedding for conditioning
-                        if args.weighted_captions:
-                            input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
-                            encoder_hidden_states1, encoder_hidden_states2, pool2 = (
-                                text_encoding_strategy.encode_tokens_with_weights(
+                        if args.use_llm_as_text_encoder: 
+                            text_encoder_conds = get_llm_text_conditioning(args, batch, a_text_encoder,a_tokenizer,accelerator, weight_dtype)
+                            
+                        else:
+                            if args.weighted_captions:
+                                input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                                encoder_hidden_states1, encoder_hidden_states2, pool2 = (
+                                    text_encoding_strategy.encode_tokens_with_weights(
+                                        tokenize_strategy,
+                                        [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
+                                        input_ids_list,
+                                        weights_list,
+                                    )
+                                )
+                            else:
+                                input_ids1 = input_ids1.to(accelerator.device)
+                                input_ids2 = input_ids2.to(accelerator.device)
+                                encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
                                     tokenize_strategy,
                                     [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
-                                    input_ids_list,
-                                    weights_list,
+                                    [input_ids1, input_ids2],
                                 )
-                            )
-                        else:
-                            input_ids1 = input_ids1.to(accelerator.device)
-                            input_ids2 = input_ids2.to(accelerator.device)
-                            encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
-                                tokenize_strategy,
-                                [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
-                                [input_ids1, input_ids2],
-                            )
-                        if args.full_fp16:
-                            encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
-                            encoder_hidden_states2 = encoder_hidden_states2.to(weight_dtype)
-                            pool2 = pool2.to(weight_dtype)
+                            if args.full_fp16:
+                                encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
+                                encoder_hidden_states2 = encoder_hidden_states2.to(weight_dtype)
+                                pool2 = pool2.to(weight_dtype)
 
                 # get size embeddings
                 orig_size = batch["original_sizes_hw"]
                 crop_size = batch["crop_top_lefts"]
                 target_size = batch["target_sizes_hw"]
                 embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
-
-                # concat embeddings
-                vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+                if args.use_llm_as_text_encoder:
+                    prompt_embeds = text_encoder_conds["prompt_embeds"].to(weight_dtype)
+                    pooled_prompt_embeds = text_encoder_conds["pooled_prompt_embeds"].to(weight_dtype)
+                    vector_embedding = torch.cat([pooled_prompt_embeds, embs], dim=1)
+                    text_embedding = prompt_embeds
+                else:
+                    # concat embeddings
+                    vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+                    text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
                 # Sample noise, sample a random timestep for each image, and add noise to the latents,
                 # with noise offset and/or multires noise if specified
@@ -760,42 +962,48 @@ def train(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                if not args.use_llm_as_text_encoder:
 
-                sdxl_train_util.sample_images(
-                    accelerator,
-                    args,
-                    None,
-                    global_step,
-                    accelerator.device,
-                    vae,
-                    tokenizers,
-                    [text_encoder1, text_encoder2],
-                    unet,
-                )
+                    sdxl_train_util.sample_images(
+                        accelerator,
+                        args,
+                        None,
+                        global_step,
+                        accelerator.device,
+                        vae,
+                        tokenizers,
+                        [text_encoder1, text_encoder2],
+                        unet,
+                    )
 
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
-                        sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(
-                            args,
-                            False,
-                            accelerator,
-                            src_path,
-                            save_stable_diffusion_format,
-                            use_safetensors,
-                            save_dtype,
-                            epoch,
-                            num_train_epochs,
-                            global_step,
-                            accelerator.unwrap_model(text_encoder1),
-                            accelerator.unwrap_model(text_encoder2),
-                            accelerator.unwrap_model(unet),
-                            vae,
-                            logit_scale,
-                            ckpt_info,
-                        )
+                        if not args.use_llm_as_text_encoder:
+                            sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(
+                                args,
+                                False,
+                                accelerator,
+                                src_path,
+                                save_stable_diffusion_format,
+                                use_safetensors,
+                                save_dtype,
+                                epoch,
+                                num_train_epochs,
+                                global_step,
+                                accelerator.unwrap_model(text_encoder1),
+                                accelerator.unwrap_model(text_encoder2),
+                                accelerator.unwrap_model(unet),
+                                vae,
+                                logit_scale,
+                                ckpt_info,
+                            )
+                        else:
+                            tag = f"step-{global_step:07d}"
+                            save_llm_adapter(args,accelerator.unwrap_model(a_text_encoder.llm_adapter), args.output_dir, tag, use_safetensors)
+
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
             if len(accelerator.trackers) > 0:
@@ -823,43 +1031,49 @@ def train(args):
 
         if args.save_every_n_epochs is not None:
             if accelerator.is_main_process:
-                src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
-                sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(
-                    args,
-                    True,
-                    accelerator,
-                    src_path,
-                    save_stable_diffusion_format,
-                    use_safetensors,
-                    save_dtype,
-                    epoch,
-                    num_train_epochs,
-                    global_step,
-                    accelerator.unwrap_model(text_encoder1),
-                    accelerator.unwrap_model(text_encoder2),
-                    accelerator.unwrap_model(unet),
-                    vae,
-                    logit_scale,
-                    ckpt_info,
-                )
-
-        sdxl_train_util.sample_images(
-            accelerator,
-            args,
-            epoch + 1,
-            global_step,
-            accelerator.device,
-            vae,
-            tokenizers,
-            [text_encoder1, text_encoder2],
-            unet,
-        )
+                if args.use_llm_as_text_encoder:
+                    save_llm_adapter(args,accelerator.unwrap_model(a_text_encoder.llm_adapter), args.output_dir, f"epoch-{epoch+1:04d}", use_safetensors)
+                else:
+                    src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
+                    sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(
+                        args,
+                        True,
+                        accelerator,
+                        src_path,
+                        save_stable_diffusion_format,
+                        use_safetensors,
+                        save_dtype,
+                        epoch,
+                        num_train_epochs,
+                        global_step,
+                        accelerator.unwrap_model(text_encoder1),
+                        accelerator.unwrap_model(text_encoder2),
+                        accelerator.unwrap_model(unet),
+                        vae,
+                        logit_scale,
+                        ckpt_info,
+                    )
+        if not args.use_llm_as_text_encoder:
+            sdxl_train_util.sample_images(
+                accelerator,
+                args,
+                epoch + 1,
+                global_step,
+                accelerator.device,
+                vae,
+                tokenizers,
+                [text_encoder1, text_encoder2],
+                unet,
+            )
 
     is_main_process = accelerator.is_main_process
     # if is_main_process:
     unet = accelerator.unwrap_model(unet)
-    text_encoder1 = accelerator.unwrap_model(text_encoder1)
-    text_encoder2 = accelerator.unwrap_model(text_encoder2)
+    if args.use_llm_as_text_encoder:
+        text_encoder = accelerator.unwrap_model(a_text_encoder.llm_adapter)
+    else:
+        text_encoder1 = accelerator.unwrap_model(text_encoder1)
+        text_encoder2 = accelerator.unwrap_model(text_encoder2)
 
     accelerator.end_training()
 
@@ -870,21 +1084,24 @@ def train(args):
 
     if is_main_process:
         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
-        sdxl_train_util.save_sd_model_on_train_end(
-            args,
-            src_path,
-            save_stable_diffusion_format,
-            use_safetensors,
-            save_dtype,
-            epoch,
-            global_step,
-            text_encoder1,
-            text_encoder2,
-            unet,
-            vae,
-            logit_scale,
-            ckpt_info,
-        )
+        if args.use_llm_as_text_encoder:
+            save_llm_adapter(args,text_encoder, args.output_dir, "final", use_safetensors)
+        else:
+            sdxl_train_util.save_sd_model_on_train_end( 
+                args,
+                src_path,
+                save_stable_diffusion_format,
+                use_safetensors,
+                save_dtype,
+                epoch,
+                global_step,
+                text_encoder1,
+                text_encoder2,
+                unet,
+                vae,
+                logit_scale,
+                ckpt_info,
+            )
         logger.info("model saved.")
 
 
@@ -903,7 +1120,28 @@ def setup_parser() -> argparse.ArgumentParser:
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
     sdxl_train_util.add_sdxl_training_arguments(parser)
-
+    parser.add_argument(
+        "--use_llm_as_text_encoder",
+        action="store_true",
+        help="Use LLM as a text encoder with an adapter.",
+    )
+    parser.add_argument(
+        "--use_qwen3VL_as_text_encoder",
+        action="store_true",
+        help="Use Qwen as a text encoder with an adapter.",
+    )
+    parser.add_argument(
+        "--llm_model_path",
+        type=str,
+        default=None,
+        help="Path to the LLM model for the text encoder.",
+    )
+    parser.add_argument(
+        "--llm_adapter_path",
+        type=str,
+        default=None,
+        help="Path to the LLM Adapter for the text encoder.",
+    )
     parser.add_argument(
         "--learning_rate_te1",
         type=float,

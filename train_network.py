@@ -47,34 +47,49 @@ from library.custom_train_functions import (
 )
 from library.utils import setup_logging, add_logging_arguments
 from safetensors.torch import load_file
-from transformers import T5GemmaEncoderModel, AutoTokenizer
+from transformers import T5GemmaEncoderModel, Qwen3VLForConditionalGeneration, AutoTokenizer
 from llm_adapter_lib.llm_to_sdxl_adapter import LLMToSDXLAdapter
 from llm_adapter_lib.t5gemma_text_encoder import T5GEMMATextEncoder
 setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+# New args
+# -- use_llm_as_text_encoder
+# -- llm_model_path [path to llm text encoder]
+# -- llm_adapter_path [path to the adapter]
+# -- use_qwen3VL_as_text_encoder
+
 
 class LLMAndAdapterTextEncoder(torch.nn.Module):
     """
     A wrapper holding both the LLM and adapter.
     """
-    def __init__(self, llm_model, llm_adapter):
+    def __init__(self, llm_model, llm_adapter, is_qwen):
         super().__init__()
         self.llm_model = llm_model
         self.llm_adapter = llm_adapter
-
+        self.is_qwen = is_qwen
     def forward(self, input_ids, attention_mask):
         """
         Forward pass from tokenized input to SDXL-compatible embeddings.
         """
-        with torch.no_grad(): # Freeze the LLM 
-            outputs = self.llm_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            )
+        if self.is_qwen:
+            with torch.no_grad(): # Freeze the LLM 
+                outputs = self.llm_model.language_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
             # from T5GEMMATextEncoder 
+            hidden_states = outputs.last_hidden_state.to(torch.float32)
+        else:
+            with torch.no_grad(): # Freeze the LLM 
+                outputs = self.llm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
             hidden_states = outputs.last_hidden_state.to(torch.float32)
 
         prompt_embeds, pooled_embeds = self.llm_adapter(hidden_states, attention_mask=attention_mask)
@@ -123,12 +138,22 @@ class NetworkTrainer:
         function for loading the LLM and adapter.
         """
         logger.info("Loading LLM and adapter.")
-
-        # LoRA will be applied to this.
-        llm_model = T5GemmaEncoderModel.from_pretrained(
-        args.llm_model_path,
-        torch_dtype=torch.bfloat16, 
-        )
+        
+        
+        # Only Load the text encoder
+        if args.use_qwen3VL_as_text_encoder:
+            llm_model = Qwen3VLForConditionalGeneration.from_pretrained(
+             args.llm_model_path,
+             torch_dtype=torch.bfloat16
+            )
+            print(f"Loaded Qwen-3-VL from: {args.llm_model_path}")
+        else:
+            llm_model = T5GemmaEncoderModel.from_pretrained(
+            args.llm_model_path,
+            torch_dtype=torch.bfloat16, 
+            )
+            print(f"Loaded T5Gemma from: {args.llm_model_path}")
+            
         llm_model.eval()
         for param in llm_model.parameters():
             param.requires_grad = False
@@ -136,9 +161,13 @@ class NetworkTrainer:
             llm_model.gradient_checkpointing_enable()
             
         ADAPTER_RESUME_PATH = args.llm_adapter_path
-
+       
+        llm_dim_input = 2304
+        if args.use_qwen3VL_as_text_encoder:
+            llm_dim_input = 2560
+         # LoRA will be applied to this.
         adapter = LLMToSDXLAdapter(
-        llm_dim=2304,
+        llm_dim=llm_dim_input,
         sdxl_seq_dim=2048,
         sdxl_pooled_dim=1280,
         max_input_len=512,
@@ -156,8 +185,8 @@ class NetworkTrainer:
 
 
         adapter.load_state_dict(new_state)
-
-        text_encoder = LLMAndAdapterTextEncoder(llm_model, adapter)
+        is_qwen = True if args.use_qwen3VL_as_text_encoder else False
+        text_encoder = LLMAndAdapterTextEncoder(llm_model, adapter, is_qwen)
         logger.info("Successfully loaded LLM and initialized adapter.")
         return text_encoder
     
@@ -182,7 +211,7 @@ class NetworkTrainer:
         captions = batch.get("captions")
         if captions is None:
          raise ValueError("Batch does not contain 'captions'.")
-        captions_with_eos = [caption + "<eos>" for caption in captions] # t5gemma_text_encoder uses <eos> 
+        captions_with_eos = [caption + tokenizer.eos_token for caption in captions] # t5gemma_text_encoder uses <eos> 
          # from t5gemma_text_encoder
         tokenized_input = tokenizer(
             captions_with_eos,
@@ -779,7 +808,7 @@ class NetworkTrainer:
 
         # load target models: unet may be None for lazy loading
         if args.use_llm_as_text_encoder:
-            model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+            model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator) # See sdxl_train_network.py
             text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
             model_version = "custom_llm"
         else:
@@ -851,7 +880,8 @@ class NetworkTrainer:
             for net_arg in args.network_args:
                 key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
-
+        if args.use_llm_as_text_encoder:
+            net_kwargs["text_encoder_target_module"]  = ["ExplicitMultiheadAttention", "TransformerBlock"] # For Lycoris kohya.py  
         # if a new network is added in future, add if ~ then blocks for each network (;'∀')
         if args.dim_from_weights:
             network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **net_kwargs)
@@ -1961,6 +1991,11 @@ def setup_parser() -> argparse.ArgumentParser:
         "--use_llm_as_text_encoder",
         action="store_true",
         help="Use LLM as a text encoder with an adapter.",
+    )
+    parser.add_argument(
+        "--use_qwen3VL_as_text_encoder",
+        action="store_true",
+        help="Use Qwen as a text encoder with an adapter.",
     )
     parser.add_argument(
         "--llm_model_path",
