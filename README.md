@@ -1,11 +1,13 @@
 This repository contains training, generation and utility scripts for Stable Diffusion.
 ## T5 Adapter Training
 
+Latest update: 20 November 2025:
+- Added T5 Adapter finetuning to sdxl_train.py
+  - Uses same args as [original](https://github.com/kohya-ss/sd-scripts) + args added to sdxl_train_network.py (see below) 
+ 
 ### **IMPORTANT** : Only LoRAs are supported currently 
 
-Latest update: 2025-10-31:
-- Implemented gradient checkpointing.
-- Switched to sd3 branch of sd-scripts
+
 ### First Release
 Added support for training LoRAs using **T5 adapter** [found here](https://huggingface.co/Minthy/Rouwei-T5Gemma-adapter_v0.2/)
 
