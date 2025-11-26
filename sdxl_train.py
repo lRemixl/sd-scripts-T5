@@ -132,12 +132,10 @@ class LLMAndAdapterTextEncoder(torch.nn.Module):
         adapter_outputs = self.llm_adapter(hidden_states, attention_mask=attention_mask)
         prompt_embeds = adapter_outputs['text_embeds']
         pooled_embeds = adapter_outputs['pooled_text_embeds']
-
-        # prompt_embeds, pooled_embeds = self.llm_adapter(hidden_states, attention_mask=attention_mask)
         
         return prompt_embeds, pooled_embeds
     
-def load_llm_and_adapter(args):
+def load_llm_and_adapter(args, train_adapter):
         """
         function for loading the LLM and adapter.
         """
@@ -172,7 +170,6 @@ def load_llm_and_adapter(args):
         llm_dim_input = 2304
         if args.use_qwen3VL_as_text_encoder:
             llm_dim_input = 2560
-         # LoRA will be applied to this.
         adapter = LLMoSDXLAdapter(
         llm_dim=llm_dim_input,
         sdxl_seq_dim=2048,
@@ -184,12 +181,20 @@ def load_llm_and_adapter(args):
         num_heads=16,
         dropout=0.05
         )
-        logger.info(f"Loading state_dict from {ADAPTER_RESUME_PATH}")
-        state_dict = load_file(ADAPTER_RESUME_PATH, device="cpu")
-        
-        adapter.load_state_dict(state_dict)
+        if ADAPTER_RESUME_PATH:
+            logger.info(f"Loading state_dict from {ADAPTER_RESUME_PATH}")
+            state_dict = load_file(ADAPTER_RESUME_PATH, device="cpu")
+            adapter.load_state_dict(state_dict)
+        else:
+            logger.warning(f"llm_adapter_path not set. Using un-trained new adapter !")
+            
         is_qwen = True if args.use_qwen3VL_as_text_encoder else False
-        adapter.requires_grad_(True)
+        if train_adapter:
+            adapter.requires_grad_(True)
+            logger.info(f"Adapter training enabled.")
+        else:
+            adapter.requires_grad_(False)
+            logger.info("Adapter training NOT enabled.")
         text_encoder = LLMAndAdapterTextEncoder(llm_model, adapter,is_qwen)
         logger.info("Successfully loaded LLM and initialized adapter.")
         return text_encoder
@@ -450,11 +455,12 @@ def train(args):
     # 学習を準備する：モデルを適切な状態にする
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-    train_unet = args.learning_rate != 0
-    train_unet = False # Added 
+    train_unet = args.learning_rate_unet != 0
     train_text_encoder1 = False
     train_text_encoder2 = False
-
+    train_adapter = args.learning_rate > 0
+    args.learning_rate = args.learning_rate_unet if not train_adapter and train_unet else args.learning_rate 
+    
     text_encoding_strategy = strategy_sdxl.SdxlTextEncodingStrategy()
     strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
 
@@ -515,16 +521,19 @@ def train(args):
     if train_unet:
         training_models.append(unet)
         if block_lrs is None:
-            params_to_optimize.append({"params": list(unet.parameters()), "lr": args.learning_rate})
+            params_to_optimize.append({"params": list(unet.parameters()), "lr": args.learning_rate_unet})
         else:
             params_to_optimize.extend(get_block_params_to_optimize(unet, block_lrs))
     if args.use_llm_as_text_encoder:
-        del text_encoder1
+        # delete CLIP text encoders and replace them with the LLM + adapter
+        del text_encoder1 
         del text_encoder2
-        a_text_encoder = load_llm_and_adapter(args)
+        a_text_encoder = load_llm_and_adapter(args, train_adapter)
         a_tokenizer = load_llm_tokenizer(args)
-        training_models.append(a_text_encoder.llm_adapter)
-        params_to_optimize.append({"params": list(a_text_encoder.llm_adapter.parameters()), "lr": args.learning_rate})
+        if train_adapter:
+            training_models.append(a_text_encoder.llm_adapter)
+            params_to_optimize.append({"params": list(a_text_encoder.llm_adapter.parameters()), "lr": args.learning_rate})
+        
 
     elif train_text_encoder1:
         training_models.append(text_encoder1)
@@ -539,7 +548,7 @@ def train(args):
         for p in group["params"]:
             n_params += p.numel()
 
-    accelerator.print(f"train unet: {train_unet}, text_encoder1: {train_text_encoder1}, text_encoder2: {train_text_encoder2}")
+    accelerator.print(f"train unet: {train_unet}, text_encoder1: {train_text_encoder1}, text_encoder2: {train_text_encoder2}, train_adapter: {train_adapter}")
     accelerator.print(f"number of models: {len(training_models)}")
     accelerator.print(f"number of trainable parameters: {n_params}")
 
@@ -1141,6 +1150,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to the LLM Adapter for the text encoder.",
+    )
+    parser.add_argument(
+        "--learning_rate_unet",
+        type=float,
+        default=0,
+        help="learning rate for the Unet",
     )
     parser.add_argument(
         "--learning_rate_te1",
