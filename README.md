@@ -1,19 +1,27 @@
 This repository contains training, generation and utility scripts for Stable Diffusion.
 ## T5 Adapter Training
 
-Latest update: 20 November 2025:
-- Added T5 Adapter finetuning to sdxl_train.py
-  - Uses same args as [original](https://github.com/kohya-ss/sd-scripts) + args added to sdxl_train_network.py (see below) 
+Latest update: 26 November 2025:
+- Added argument learning_rate_unet
+ - controls the learning rate for the unet
+   - if it's not set, then the unet is frozen.
+ - To freeze the **Adapter** and train only the **Unet**, set learning_rate to 0 and set learning_rate_unet to the learning rate you want for the Unet. 
+
+
+### T5 Finetuning (sdxl_train.py) 
+ - Uses same args as [original](https://github.com/kohya-ss/sd-scripts) and adds the args:
+ - -- use_llm_as_text_encoder 
+ - -- llm_model_path [path to llm text encoder]
+ - -- llm_adapter_path [path to the adapter]
+ - -- learning_rate_unet [learning_rate_for_the_unet] # Don't use this argument if you **don't** want to train the Unet / want to keep it frozen.
  
-### **IMPORTANT** : Only LoRAs are supported currently 
+### **IMPORTANT** : Only LoRAs are supported currently in sdxl_train_network.py
 
 
-### First Release
+### T5 Lora training (sdxl_train_network.py)
 Added support for training LoRAs using **T5 adapter** [found here](https://huggingface.co/Minthy/Rouwei-T5Gemma-adapter_v0.2/)
 
 LoRAs should be used along-side [custom nodes](https://github.com/NeuroSenko/ComfyUI_LLM_SDXL_Adapter/) or [Fork](https://github.com/lRemixl/ComfyUI_LLM_SDXL_Adapter/tree/dev-lora)  
-
-
 
 Use the args:
 - -- use_llm_as_text_encoder 
