@@ -1570,12 +1570,24 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoder_outputs_list = []
         custom_attributes = []
 
+        cached_llm_outputs = [] # ADDED
+        
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
 
             custom_attributes.append(subset.custom_attributes)
-
+            
+            abs_path_image_info = getattr(image_info, "absolute_path", None) 
+            if abs_path_image_info:
+                base_path, extension = os.path.splitext(abs_path_image_info)
+                cached_llm_output_path = f"{base_path}.llm_embed.safetensors"
+                if os.path.exists(cached_llm_output_path):
+                    cached_llm_output_data = safetensors.torch.load_file(cached_llm_output_path)
+                    cached_llm_outputs.append(cached_llm_output_data) 
+                else:
+                    cached_llm_outputs.append(None) 
+            
             # in case of fine tuning, is_reg is always False
             loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
 
@@ -1785,6 +1797,10 @@ class BaseDataset(torch.utils.data.Dataset):
         example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
 
+        if any(p is not None for p in cached_llm_outputs):
+            example["cached_llm_outputs"] = cached_llm_outputs
+
+        
         # if one of alpha_masks is not None, we need to replace None with ones
         none_or_not = [x is None for x in alpha_mask_list]
         if all(none_or_not):

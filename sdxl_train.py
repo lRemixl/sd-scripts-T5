@@ -25,6 +25,7 @@ import library.train_util as train_util
 
 from library.utils import setup_logging, add_logging_arguments
 from scripts.llm_to_sdxl_adapter import LLMoSDXLAdapter
+import cache_llm_outputs
 setup_logging()
 import logging
 
@@ -107,28 +108,32 @@ class LLMAndAdapterTextEncoder(torch.nn.Module):
         self.llm_adapter = llm_adapter
         self.is_qwen = is_qwen
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, cached_hidden_states=None):
         """
         Forward pass from tokenized input to SDXL-compatible embeddings.
         """
-        if self.is_qwen:
-            with torch.no_grad(): # Freeze the LLM 
-                outputs = self.llm_model.language_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                )
-            # from T5GEMMATextEncoder 
-            hidden_states = outputs.last_hidden_state.to(torch.float32)
+        if cached_hidden_states is None:
+            if self.is_qwen:
+                with torch.no_grad(): # Freeze the LLM 
+                    outputs = self.llm_model.language_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                    )
+                # from T5GEMMATextEncoder 
+                hidden_states = outputs.last_hidden_state.to(torch.float32)
+            else:
+                with torch.no_grad(): # Freeze the LLM 
+                    outputs = self.llm_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                    )
+                # from T5GEMMATextEncoder 
+                hidden_states = outputs.last_hidden_state.to(torch.float32)
         else:
-            with torch.no_grad(): # Freeze the LLM 
-                outputs = self.llm_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                )
-            # from T5GEMMATextEncoder 
-            hidden_states = outputs.last_hidden_state.to(torch.float32)
+            hidden_states = cached_hidden_states.to(self.llm_adapter.parameters().__next__().dtype)
+
         adapter_outputs = self.llm_adapter(hidden_states, attention_mask=attention_mask)
         prompt_embeds = adapter_outputs['text_embeds']
         pooled_embeds = adapter_outputs['pooled_text_embeds']
@@ -143,27 +148,31 @@ def load_llm_and_adapter(args, train_adapter):
         
         
         # Only Load the text encoder
-        if args.use_qwen3VL_as_text_encoder:
-            llm_model = Qwen3VLForConditionalGeneration.from_pretrained(
-             args.llm_model_path,
-             torch_dtype=torch.bfloat16,
-             trust_remote_code=True
-            )
-            
-            
-            print(f"Loaded Qwen-3-VL from: {args.llm_model_path}")
+        if args.cache_llm_outputs:
+            llm_model = None
+            logger.info(f"Cached LLM outputs. No need to load LLM")
         else:
-            llm_model = T5GemmaEncoderModel.from_pretrained(
-            args.llm_model_path,
-            torch_dtype=torch.bfloat16, 
-            )
-            print(f"Loaded T5Gemma from: {args.llm_model_path}")
-        llm_model.requires_grad_(False)
-        llm_model.eval()
-        for param in llm_model.parameters():
-            param.requires_grad = False
-        if args.gradient_checkpointing:
-            llm_model.gradient_checkpointing_enable()
+            if args.use_qwen3VL_as_text_encoder:
+                llm_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                args.llm_model_path,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True
+                )
+                
+                
+                print(f"Loaded Qwen-3-VL from: {args.llm_model_path}")
+            else:
+                llm_model = T5GemmaEncoderModel.from_pretrained(
+                args.llm_model_path,
+                torch_dtype=torch.bfloat16, 
+                )
+                print(f"Loaded T5Gemma from: {args.llm_model_path}")
+            llm_model.requires_grad_(False)
+            llm_model.eval()
+            for param in llm_model.parameters():
+                param.requires_grad = False
+            if args.gradient_checkpointing:
+                llm_model.gradient_checkpointing_enable()
             
         ADAPTER_RESUME_PATH = args.llm_adapter_path
        
@@ -217,21 +226,38 @@ def get_llm_text_conditioning(args, batch, text_encoder, tokenizer, accelerator,
         function for getting text conditioning from LLM.
         """
         # Take captions from batch pass through the LLM and adapter, and return the embeddings
-        captions = batch.get("captions")
-        if captions is None:
-         raise ValueError("Batch does not contain 'captions'.")
-        captions_with_eos = [caption + tokenizer.eos_token for caption in captions] # t5gemma_text_encoder uses <eos> 
-         # from t5gemma_text_encoder
-        tokenized_input = tokenizer(
-            captions_with_eos,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=512, 
-            truncation=True,
-        )
-        input_ids = tokenized_input.input_ids.to(accelerator.device)
-        attention_mask = tokenized_input.attention_mask.to(accelerator.device)
-        prompt_embeds, pooled_embeds = text_encoder(input_ids, attention_mask)
+        if args.cache_llm_outputs:
+            cached_llm_outputs = batch.get("cached_llm_outputs") 
+    
+            list_hidden = []
+            list_masks = []
+            
+            for data in cached_llm_outputs:
+                list_hidden.append(data["last_hidden_state"])
+                list_masks.append(data["attention_mask"])
+                
+            # Stack them into a batch
+            hidden_states = torch.stack(list_hidden).to(accelerator.device)
+            attention_mask = torch.stack(list_masks).to(accelerator.device)
+            
+            # Forward pass through Adapter only
+            prompt_embeds, pooled_embeds = text_encoder("", attention_mask, hidden_states)
+        else:
+            captions = batch.get("captions")
+            if captions is None:
+                raise ValueError("Batch does not contain 'captions'.")
+            captions_with_eos = [caption + tokenizer.eos_token for caption in captions] # t5gemma_text_encoder uses <eos> 
+            # from t5gemma_text_encoder
+            tokenized_input = tokenizer(
+                captions_with_eos,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=512, 
+                truncation=True,
+            )
+            input_ids = tokenized_input.input_ids.to(accelerator.device)
+            attention_mask = tokenized_input.attention_mask.to(accelerator.device)
+            prompt_embeds, pooled_embeds = text_encoder(input_ids, attention_mask)
 
         return {
             "prompt_embeds": prompt_embeds,
@@ -274,7 +300,9 @@ def train(args):
     sdxl_train_util.verify_sdxl_training_args(args)
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
-
+    if args.cache_llm_outputs:
+        logger.info(f"Caching LLM outputs...")
+        cache_llm_outputs.process_dataset(args)
     assert (
         not args.weighted_captions or not args.cache_text_encoder_outputs
     ), "weighted_captions is not supported when caching text encoder outputs / cache_text_encoder_outputsを使うときはweighted_captionsはサポートされていません"
@@ -529,7 +557,10 @@ def train(args):
         del text_encoder1 
         del text_encoder2
         a_text_encoder = load_llm_and_adapter(args, train_adapter)
-        a_tokenizer = load_llm_tokenizer(args)
+        if args.cache_llm_outputs:
+            a_tokenizer = None
+        else:
+            a_tokenizer = load_llm_tokenizer(args)
         if train_adapter:
             training_models.append(a_text_encoder.llm_adapter)
             params_to_optimize.append({"params": list(a_text_encoder.llm_adapter.parameters()), "lr": args.learning_rate})
@@ -705,7 +736,8 @@ def train(args):
             text_encoder2.to(accelerator.device)
         else:
             a_text_encoder.llm_adapter.to(accelerator.device)
-            a_text_encoder.llm_model.to(accelerator.device)
+            if not args.cache_llm_outputs:
+                a_text_encoder.llm_model.to(accelerator.device)
             a_text_encoder.llm_adapter = accelerator.prepare(a_text_encoder.llm_adapter)
 
             # a_tokenizer.to(accelerator.device)
@@ -1156,6 +1188,11 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0,
         help="learning rate for the Unet",
+    )
+    parser.add_argument(
+        "--cache_llm_outputs",
+        action="store_true",
+        help="Cache LLM outputs before training.",
     )
     parser.add_argument(
         "--learning_rate_te1",
