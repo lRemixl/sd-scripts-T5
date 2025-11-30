@@ -18,6 +18,7 @@ Update: 26 November 2025:
  - -- llm_model_path [path to llm text encoder]
  - -- llm_adapter_path [path to the adapter]
  - -- learning_rate_unet [learning_rate_for_the_unet] # Don't use this argument if you **don't** want to train the Unet / want to keep it frozen.
+ - -- cache_llm_outputs # Only use if you want to pre-cache the LLM outputs to disk. Lowers VRAM requirements.
  
 ### **IMPORTANT** : Only LoRAs are supported currently in sdxl_train_network.py
 
