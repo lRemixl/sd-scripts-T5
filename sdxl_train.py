@@ -19,7 +19,7 @@ from accelerate.utils import set_seed
 from diffusers import DDPMScheduler # type: ignore
 from safetensors.torch import load_file
 from transformers import Qwen3VLForConditionalGeneration, T5GemmaEncoderModel, AutoTokenizer
-from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec
+from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec, model_util
 
 import library.train_util as train_util
 
@@ -97,6 +97,54 @@ def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
         block_index += 1
 
     train_util.append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names)
+    
+def save_stable_diffusion_checkpoint(
+    output_file,
+    unet,
+    epochs,
+    steps,
+    ckpt_info,
+    vae,
+    logit_scale,
+    metadata,
+    save_dtype=None,
+):
+    state_dict = {}
+
+    def update_sd(prefix, sd):
+        for k, v in sd.items():
+            key = prefix + k
+            if save_dtype is not None:
+                v = v.detach().clone().to("cpu").to(save_dtype)
+            state_dict[key] = v
+
+    # Convert the UNet model
+    update_sd("model.diffusion_model.", unet.state_dict())
+
+    # Convert the text encoders
+
+    # Convert the VAE
+    vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
+    update_sd("first_stage_model.", vae_dict)
+
+    # Put together new checkpoint
+    key_count = len(state_dict.keys())
+    new_ckpt = {"state_dict": state_dict}
+
+    # epoch and global_step are sometimes not int
+    if ckpt_info is not None:
+        epochs += ckpt_info[0]
+        steps += ckpt_info[1]
+
+    new_ckpt["epoch"] = epochs
+    new_ckpt["global_step"] = steps
+    from safetensors.torch import save_file
+    if model_util.is_safetensors(output_file):
+        save_file(state_dict, output_file, metadata)
+    else:
+        torch.save(new_ckpt, output_file)
+
+    return key_count
 
 class LLMAndAdapterTextEncoder(torch.nn.Module):
     """
@@ -1074,6 +1122,23 @@ def train(args):
             if accelerator.is_main_process:
                 if args.use_llm_as_text_encoder:
                     save_llm_adapter(args,accelerator.unwrap_model(a_text_encoder.llm_adapter), args.output_dir, f"epoch-{epoch+1:04d}", use_safetensors)
+                    if train_unet:
+                        ckpt_name = train_util.get_epoch_ckpt_name(args, ".safetensors", epoch)
+                        ckpt_file = os.path.join(args.output_dir, ckpt_name)
+                        logger.info(f"saving checkpoint: {ckpt_file}")
+                        sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
+                        save_stable_diffusion_checkpoint(
+                            ckpt_file,
+                            accelerator.unwrap_model(unet),
+                            epoch,
+                            global_step,
+                            ckpt_info,
+                            vae,
+                            logit_scale,
+                            sai_metadata,
+                            save_dtype,
+                            )
+                        
                 else:
                     src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
                     sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(
@@ -1127,6 +1192,24 @@ def train(args):
         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
         if args.use_llm_as_text_encoder:
             save_llm_adapter(args,text_encoder, args.output_dir, "final", use_safetensors)
+            if train_unet:
+                ckpt_name = train_util.get_epoch_ckpt_name(args, ".safetensors", epoch)
+                ckpt_file = os.path.join(args.output_dir, ckpt_name)
+                logger.info(f"saving checkpoint: {ckpt_file}")
+                sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
+                save_stable_diffusion_checkpoint(
+                    ckpt_file,
+                    unet,
+                    epoch,
+                    global_step,
+                    ckpt_info,
+                    vae,
+                    logit_scale,
+                    sai_metadata,
+                    save_dtype,
+                    )
+                        
+            
         else:
             sdxl_train_util.save_sd_model_on_train_end( 
                 args,
