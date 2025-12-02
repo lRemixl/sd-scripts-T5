@@ -1,8 +1,12 @@
 This repository contains training, generation and utility scripts for Stable Diffusion.
 ## T5 Adapter Training
+Latest Update: 30 November 2025:
+- Added argument cache_llm_outputs to **sdxl_train.py** (Finetuning Only)
+- Pre-caches the LLM outputs to disk before the main train loop. Thus saving on VRAM as you don't need to have the LLM loaded for training.
+- The main logic for this is in cache_llm_outputs.py.
 
-Latest update: 26 November 2025:
-- Added argument learning_rate_unet
+Update: 26 November 2025:
+- Added argument learning_rate_unet to **sdxl_train.py**
  - controls the learning rate for the unet
    - if it's not set, then the unet is frozen.
  - To freeze the **Adapter** and train only the **Unet**, set learning_rate to 0 and set learning_rate_unet to the learning rate you want for the Unet. 
@@ -14,6 +18,7 @@ Latest update: 26 November 2025:
  - -- llm_model_path [path to llm text encoder]
  - -- llm_adapter_path [path to the adapter]
  - -- learning_rate_unet [learning_rate_for_the_unet] # Don't use this argument if you **don't** want to train the Unet / want to keep it frozen.
+ - -- cache_llm_outputs # Only use if you want to pre-cache the LLM outputs to disk. Lowers VRAM requirements.
  
 ### **IMPORTANT** : Only LoRAs are supported currently in sdxl_train_network.py
 

@@ -4,9 +4,9 @@ import glob
 from tqdm import tqdm
 import torch
 from safetensors.torch import save_file, load_file
-from transformers import Qwen3VLForConditionalGeneration, T5GemmaEncoderModel, AutoTokenizer  # type: ignore
+from transformers import Qwen3VLForConditionalGeneration, T5GemmaEncoderModel, AutoTokenizer  
 
-# Import your initialization logic
+
 from library.device_utils import init_ipex
 
 def setup_args():
@@ -81,7 +81,7 @@ def process_dataset(args):
         torch.cuda.empty_cache()
         return
 
-    # Process in batches
+    # Process batches
     for i in tqdm(range(0, len(files), args.train_batch_size)):
         batch_files = files[i : i + args.train_batch_size]
         captions = []
