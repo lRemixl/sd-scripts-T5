@@ -1,0 +1,51 @@
+[additional_network_arguments]
+unet_lr = 0.0005
+network_module = "lycoris.kohya"
+network_args = ["conv_dim=32", "conv_alpha=32.0", "algo=locon", "train_norm=True"]
+
+
+[optimizer_arguments]
+lr_scheduler       = "rex"
+optimizer_type     = "AdamW8Kahan"
+optimizer_args     = ["weight_decay=0.01"]
+min_lr             = 0
+
+[training_arguments]
+max_train_epochs    = 50
+#protected_tags_file = "cleaned.txt"
+loss_type          = "l2"
+save_every_n_epochs = 5
+save_last_n_epochs  = 10
+train_batch_size   = 16
+max_grad_norm      = 1
+weighted_captions  = false
+seed               = 21463286
+max_token_length   = 225
+lowram             = false
+max_data_loader_n_workers = 8
+persistent_data_loader_workers = true
+save_precision     = "bf16"
+mixed_precision    = "bf16"
+full_bf16          = true
+output_dir         = "Output-Folder"
+output_name        = "Test"
+
+
+[model_arguments]
+pretrained_model_name_or_path = "Mugen.safetensors"
+vae="tools/black-forest-labs/FLUX.2-dev" #OwO
+v2                    = false
+sdxl                  = true
+gradient_checkpointing = true
+gradient_accumulation_steps = 2
+sdpa                  = true
+xformers              = false
+
+[saving_arguments]
+save_model_as = "safetensors"
+
+
+[dataset_arguments]
+cache_latents              = true
+cache_latents_to_disk      = true
+lr_warmup_steps            = 160

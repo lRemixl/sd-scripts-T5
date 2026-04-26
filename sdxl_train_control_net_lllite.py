@@ -23,17 +23,7 @@ from accelerate.utils import set_seed
 import accelerate
 from diffusers import DDPMScheduler, ControlNetModel
 from safetensors.torch import load_file
-from library import (
-    deepspeed_utils,
-    sai_model_spec,
-    sdxl_model_util,
-    sdxl_original_unet,
-    sdxl_train_util,
-    strategy_base,
-    strategy_sd,
-    strategy_sdxl,
-    sai_model_spec,
-)
+from library import deepspeed_utils, sai_model_spec, sdxl_model_util, sdxl_original_unet, sdxl_train_util
 
 import library.model_util as model_util
 import library.train_util as train_util
@@ -89,14 +79,7 @@ def train(args):
         args.seed = random.randint(0, 2**32)
     set_seed(args.seed)
 
-    tokenize_strategy = strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
-    strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
-
-    # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
-    latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
-        False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
-    )
-    strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
+    tokenizer1, tokenizer2 = sdxl_train_util.load_tokenizers(args)
 
     # データセットを準備する
     blueprint_generator = BlueprintGenerator(ConfigSanitizer(False, False, True, True))
@@ -123,8 +106,8 @@ def train(args):
             ]
         }
 
-    blueprint = blueprint_generator.generate(user_config, args)
-    train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    blueprint = blueprint_generator.generate(user_config, args, tokenizer=[tokenizer1, tokenizer2])
+    train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
@@ -181,30 +164,30 @@ def train(args):
         vae.to(accelerator.device, dtype=vae_dtype)
         vae.requires_grad_(False)
         vae.eval()
-
-        train_dataset_group.new_cache_latents(vae, accelerator)
-
+        with torch.no_grad():
+            train_dataset_group.cache_latents(
+                vae,
+                args.vae_batch_size,
+                args.cache_latents_to_disk,
+                accelerator.is_main_process,
+            )
         vae.to("cpu")
         clean_memory_on_device(accelerator.device)
 
         accelerator.wait_for_everyone()
 
-    text_encoding_strategy = strategy_sdxl.SdxlTextEncodingStrategy()
-    strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
-
     # TextEncoderの出力をキャッシュする
     if args.cache_text_encoder_outputs:
         # Text Encodes are eval and no grad
-        text_encoder_output_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
-            args.cache_text_encoder_outputs_to_disk, None, False
-        )
-        strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_output_caching_strategy)
-
-        text_encoder1.to(accelerator.device)
-        text_encoder2.to(accelerator.device)
-        with accelerator.autocast():
-            train_dataset_group.new_cache_text_encoder_outputs([text_encoder1, text_encoder2], accelerator)
-
+        with torch.no_grad():
+            train_dataset_group.cache_text_encoder_outputs(
+                (tokenizer1, tokenizer2),
+                (text_encoder1, text_encoder2),
+                accelerator.device,
+                None,
+                args.cache_text_encoder_outputs_to_disk,
+                accelerator.is_main_process,
+            )
         accelerator.wait_for_everyone()
 
     # prepare ControlNet-LLLite
@@ -259,11 +242,7 @@ def train(args):
 
     _, _, optimizer = train_util.get_optimizer(args, trainable_params)
 
-    # prepare dataloader
-    # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
-    # some strategies can be None
-    train_dataset_group.set_current_strategies()
-
+    # dataloaderを準備する
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
 
@@ -311,7 +290,7 @@ def train(args):
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)
 
     if isinstance(unet, DDP):
-        unet._set_static_graph()  # avoid error for multiple use of the parameter
+        unet._set_static_graph() # avoid error for multiple use of the parameter
 
     if args.gradient_checkpointing:
         unet.train()  # according to TI example in Diffusers, train is required -> これオリジナルのU-Netしたので本当は外せる
@@ -378,9 +357,7 @@ def train(args):
         if args.log_tracker_config is not None:
             init_kwargs = toml.load(args.log_tracker_config)
         accelerator.init_trackers(
-            "lllite_control_net_train" if args.log_tracker_name is None else args.log_tracker_name,
-            config=train_util.get_sanitized_config_or_none(args),
-            init_kwargs=init_kwargs,
+            "lllite_control_net_train" if args.log_tracker_name is None else args.log_tracker_name, config=train_util.get_sanitized_config_or_none(args), init_kwargs=init_kwargs
         )
 
     loss_recorder = train_util.LossRecorder()
@@ -432,25 +409,28 @@ def train(args):
                             latents = torch.nan_to_num(latents, 0, out=latents)
                     latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
 
-                text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-                if text_encoder_outputs_list is not None:
-                    # Text Encoder outputs are cached
-                    encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_outputs_list
-                    encoder_hidden_states1 = encoder_hidden_states1.to(accelerator.device, dtype=weight_dtype)
-                    encoder_hidden_states2 = encoder_hidden_states2.to(accelerator.device, dtype=weight_dtype)
-                    pool2 = pool2.to(accelerator.device, dtype=weight_dtype)
-                else:
-                    input_ids1, input_ids2 = batch["input_ids_list"]
+                if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
+                    input_ids1 = batch["input_ids"]
+                    input_ids2 = batch["input_ids2"]
                     with torch.no_grad():
+                        # Get the text embedding for conditioning
                         input_ids1 = input_ids1.to(accelerator.device)
                         input_ids2 = input_ids2.to(accelerator.device)
-                        encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
-                            tokenize_strategy, [text_encoder1, text_encoder2], [input_ids1, input_ids2]
+                        encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
+                            args.max_token_length,
+                            args.use_zero_cond_dropout,
+                            input_ids1,
+                            input_ids2,
+                            tokenizer1,
+                            tokenizer2,
+                            text_encoder1,
+                            text_encoder2,
+                            None if not args.full_fp16 else weight_dtype,
                         )
-                        if args.full_fp16:
-                            encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
-                            encoder_hidden_states2 = encoder_hidden_states2.to(weight_dtype)
-                            pool2 = pool2.to(weight_dtype)
+                else:
+                    encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
+                    encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
+                    pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
 
                 # get size embeddings
                 orig_size = batch["original_sizes_hw"]
@@ -464,7 +444,9 @@ def train(args):
 
                 # Sample noise, sample a random timestep for each image, and add noise to the latents,
                 # with noise offset and/or multires noise if specified
-                noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
+                noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
+                    args, noise_scheduler, latents
+                )
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
@@ -483,8 +465,9 @@ def train(args):
                 else:
                     target = noise
 
-                huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-                loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                loss = train_util.conditional_loss(
+                    noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                )
                 loss = loss.mean([1, 2, 3])
 
                 loss_weights = batch["loss_weights"]  # 各sampleごとのweight
@@ -538,14 +521,14 @@ def train(args):
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
-            if len(accelerator.trackers) > 0:
+            if args.logging_dir is not None:
                 logs = generate_step_logs(args, current_loss, avr_loss, lr_scheduler)
                 accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
 
-        if len(accelerator.trackers) > 0:
+        if args.logging_dir is not None:
             logs = {"loss/epoch": loss_recorder.moving_average}
             accelerator.log(logs, step=epoch + 1)
 
@@ -590,7 +573,6 @@ def setup_parser() -> argparse.ArgumentParser:
 
     add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
-    sai_model_spec.add_model_spec_arguments(parser)
     train_util.add_dataset_arguments(parser, False, True, True)
     train_util.add_training_arguments(parser, False)
     deepspeed_utils.add_deepspeed_arguments(parser)
@@ -629,6 +611,12 @@ def setup_parser() -> argparse.ArgumentParser:
         "--no_half_vae",
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
+    )
+    parser.add_argument(
+        "--use_zero_cond_dropout",
+        type=bool,
+        default=False,
+        help="For full caption dropout, use zero conditioning instead of empty caption"
     )
     return parser
 

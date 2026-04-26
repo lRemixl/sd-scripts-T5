@@ -1,0 +1,51 @@
+[additional_network_arguments]
+learning_rate      = 2e-5
+train_text_encoder = false
+text_encoder_lr    = 5e-5
+
+[optimizer_arguments]
+lr_scheduler       = "REX"
+optimizer_type     = "AdamW8kahan"
+optimizer_args     = ["weight_decay=1e-5"] #0.01 for AdamW
+min_lr             = 0
+
+[training_arguments]
+max_train_steps    = 1200
+protected_tags_file = "/home/bluvoll/Documentos/pipeline download/tags.txt"
+loss_type          = "l2"
+save_every_n_epochs = 1
+save_every_n_steps = 100
+save_last_n_epochs  = 5
+train_batch_size   = 8
+max_grad_norm      = 1
+weighted_captions  = false
+seed               = 997
+max_token_length   = 225
+lowram             = false
+max_data_loader_n_workers = 4
+persistent_data_loader_workers = true
+save_precision     = "bf16"
+mixed_precision    = "bf16"
+#full_bf16          = true
+output_dir         = "/home/bluvoll/stable-diffusion-webui-reForge/models/Stable-diffusion/"
+output_name        = "Stage-1"
+
+[model_arguments]
+pretrained_model_name_or_path = "ChenkinNoob-XL-V0.1.safetensors"
+v2                    = false
+sdxl                  = true
+gradient_checkpointing = true
+gradient_accumulation_steps = 4
+sdpa                  = true
+logging_dir ="logs"
+log_with = "wandb"
+wandb_run_name = "RF-Test-Chenkin-Stage1"
+
+[saving_arguments]
+save_model_as = "safetensors"
+
+
+[dataset_arguments]
+cache_latents              = true
+cache_latents_to_disk      = true
+lr_warmup_steps            = 100

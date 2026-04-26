@@ -5,8 +5,8 @@ import math
 import os
 
 import torch
+from torch import nn
 from library.device_utils import init_ipex
-
 init_ipex()
 
 import diffusers
@@ -15,10 +15,8 @@ from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline  # ,
 from safetensors.torch import load_file, save_file
 from library.original_unet import UNet2DConditionModel
 from library.utils import setup_logging
-
 setup_logging()
 import logging
-
 logger = logging.getLogger(__name__)
 
 # DiffUsers版StableDiffusionのモデルパラメータ
@@ -977,7 +975,7 @@ def load_checkpoint_with_text_encoder_conversion(ckpt_path, device="cpu"):
         checkpoint = None
         state_dict = load_file(ckpt_path)  # , device) # may causes error
     else:
-        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(ckpt_path, map_location=device)
         if "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
         else:
@@ -1307,6 +1305,25 @@ def load_vae(vae_id, dtype):
 
     vae = AutoencoderKL(**vae_config)
     vae.load_state_dict(converted_vae_checkpoint)
+    return vae
+
+
+def use_reflection_padding(vae):
+    """Switch padded convolutions in a VAE to reflection padding."""
+    updated = 0
+    for module in vae.modules():
+        if isinstance(module, nn.Conv2d):
+            if isinstance(module.padding, tuple):
+                pad_h, pad_w = module.padding
+            else:
+                pad_h = pad_w = module.padding
+            if pad_h > 0 or pad_w > 0:
+                module.padding_mode = "reflect"
+                updated += 1
+    if updated > 0:
+        logger.info(f"enabled reflection padding for {updated} VAE conv layers")
+    else:
+        logger.info("VAE reflection padding requested but no padded convolutions were found")
     return vae
 
 

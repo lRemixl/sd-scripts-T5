@@ -13,7 +13,7 @@ import torch
 import re
 from library.utils import setup_logging
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
-from llm_adapter_lib.llm_to_sdxl_adapter import LLMToSDXLAdapter 
+
 setup_logging()
 import logging
 
@@ -418,7 +418,7 @@ def create_network(
     network_dim: Optional[int],
     network_alpha: Optional[float],
     vae: AutoencoderKL,
-    text_encoder: Union[torch.nn.Module, List[torch.nn.Module]], 
+    text_encoder: Union[CLIPTextModel, List[CLIPTextModel]],
     unet,
     neuron_dropout: Optional[float] = None,
     **kwargs,
@@ -876,7 +876,7 @@ class LoRANetwork(torch.nn.Module):
 
     def __init__(
         self,
-        text_encoder: Union[List[torch.nn.Module], torch.nn.Module],
+        text_encoder: Union[List[CLIPTextModel], CLIPTextModel],
         unet,
         multiplier: float = 1.0,
         lora_dim: int = 4,
@@ -1015,37 +1015,23 @@ class LoRANetwork(torch.nn.Module):
                             loras.append(lora)
             return loras, skipped
 
-        text_encoder_modules = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+        text_encoders = text_encoder if type(text_encoder) == list else [text_encoder]
+
         # create LoRA for text encoder
         # 毎回すべてのモジュールを作るのは無駄なので要検討
         self.text_encoder_loras = []
         skipped_te = []
-        for i, text_encoder in enumerate(text_encoder_modules):
-            if len(text_encoder_modules) > 1:
+        for i, text_encoder in enumerate(text_encoders):
+            if len(text_encoders) > 1:
                 index = i + 1
                 logger.info(f"create LoRA for Text Encoder {index}:")
             else:
                 index = None
                 logger.info(f"create LoRA for Text Encoder:")
-            if isinstance(text_encoder, LLMToSDXLAdapter):
-                logger.info(f"create LoRA for Custom Text Encoder ({text_encoder.__class__.__name__}):")
-                prefix = self.LORA_PREFIX_TEXT_ENCODER # prefix lora_te 
-                loras = []
-                for name, child_module in text_encoder.named_modules():
-                    if isinstance(child_module, torch.nn.Linear):
-                        lora_name = f"{prefix}.{name}".replace(".", "_")
-                        dim = self.lora_dim
-                        alpha = self.alpha
-                        lora = module_class(
-                            lora_name, child_module, self.multiplier, dim, alpha,
-                            dropout=dropout, rank_dropout=rank_dropout, module_dropout=module_dropout,
-                        )
-                        loras.append(lora)
-                self.text_encoder_loras.extend(loras)
-            else: 
-                text_encoder_loras, skipped = create_modules(False, index, text_encoder, LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE)
-                self.text_encoder_loras.extend(text_encoder_loras)
-                skipped_te += skipped
+
+            text_encoder_loras, skipped = create_modules(False, index, text_encoder, LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE)
+            self.text_encoder_loras.extend(text_encoder_loras)
+            skipped_te += skipped
         logger.info(f"create LoRA for Text Encoder: {len(self.text_encoder_loras)} modules.")
 
         # extend U-Net target modules if conv2d 3x3 is enabled, or load from weights
