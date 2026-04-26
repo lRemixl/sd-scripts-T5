@@ -9,8 +9,9 @@ Arguments added:
   
   --llm_adapter_path [Path to Jina-clip-v2 adapter]
 
-If you want to train a lora for Mugen using the Jina-clip-v2 adapter, you should use this version of [Mugen](https://huggingface.co/TheRemixer/jina-clip-v2-adapter/blob/main/MugenJinaUNET.safetensors)
+**Recommened that you install flash-attention**
 
+If you want to train a lora for Mugen using the Jina-clip-v2 adapter, you should use this version of [Mugen](https://huggingface.co/TheRemixer/jina-clip-v2-adapter/blob/main/MugenJinaUNET.safetensors)
 
 ## Not working, Ignore:
 
