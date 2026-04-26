@@ -9,23 +9,27 @@ Arguments added:
   
   --llm_adapter_path [Path to Jina-clip-v2 adapter]
 
-If you want the lora to target the Jina-adapter too, make sure you're using lycoris-lora and add this to your network args `'text_encoder_target_module=CLIPAttention,CLIPSdpaAttention,CLIPMLP,JinaToSDXLAdapterV2,TransformerBlock,ExplicitMultiheadAttention,AttentionPooler'` 
-
-For example:
-```
---network_args = [
-    'conv_dim=64', 
-    'conv_alpha=32.0', 
-    'algo=locon', 
-    'preset=full', 
-    'train_norm=True', 
-    'torch_compile=False', 
-    'use_scalar=False',
-'text_encoder_target_module=CLIPAttention,CLIPSdpaAttention,CLIPMLP,JinaToSDXLAdapterV2,TransformerBlock,ExplicitMultiheadAttention,AttentionPooler'
-]
-```
-
 If you want to train a lora for Mugen using the Jina-clip-v2 adapter, you should use this version of [Mugen](https://huggingface.co/TheRemixer/jina-clip-v2-adapter/blob/main/MugenJinaUNET.safetensors)
+
+
+## Not working, Ignore:
+
+  ~~If you want the lora to target the Jina-adapter too, make sure you're using lycoris-lora and add this to your network args~~`'text_encoder_target_module=CLIPAttention,CLIPSdpaAttention,CLIPMLP,JinaToSDXLAdapterV2,TransformerBlock,ExplicitMultiheadAttention,AttentionPooler'` 
+  
+  ~~For example:~~
+  ```
+  --network_args = [
+      'conv_dim=64', 
+      'conv_alpha=32.0', 
+      'algo=locon', 
+      'preset=full', 
+      'train_norm=True', 
+      'torch_compile=False', 
+      'use_scalar=False',
+  'text_encoder_target_module=CLIPAttention,CLIPSdpaAttention,CLIPMLP,JinaToSDXLAdapterV2,TransformerBlock,ExplicitMultiheadAttention,AttentionPooler'
+  ]
+  ```
+
 ### What for?
 
 SDXL-based models ([NoobAI-XL](https://civitai.com/models/833294?modelVersionId=1190596)) converted to Rectified flow / RF and more:
