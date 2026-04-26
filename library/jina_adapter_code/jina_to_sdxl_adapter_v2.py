@@ -28,7 +28,7 @@ class AttentionPooler(nn.Module):
     def __init__(self, dim, num_heads=8):
         super().__init__()
         self.query = nn.Parameter(torch.randn(1, 1, dim))
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True) # should use ExplicitMHA but...
+        self.attn = ExplicitMultiheadAttention(dim, num_heads, dropout=0.0) # For LoRa support
         self.norm = nn.LayerNorm(dim)
         
     def forward(self, x, mask=None):

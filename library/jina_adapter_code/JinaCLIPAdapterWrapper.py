@@ -65,6 +65,43 @@ class JinaAndAdapter(torch.nn.Module):
         prompt_embeds, pooled_embeds = self.llm_adapter(**input_data)
         
         return prompt_embeds, pooled_embeds
+    
+def convert_state_dict_for_explicit_attention(state_dict):
+    """
+    Converts PyTorch native fused 'in_proj_weight' and 'in_proj_bias' 
+    into separate q, k, v projections for ExplicitMultiheadAttention.
+    """
+    new_state_dict = state_dict.copy()
+    
+    # We iterate over a list of keys so we can modify the dictionary during the loop
+    for key in list(new_state_dict.keys()):
+        # Look for the fused weight matrix
+        if key.endswith("in_proj_weight"):
+            # Extract the base path (e.g., "attention_pooler.attn.")
+            prefix = key.replace("in_proj_weight", "")
+            
+            # Pop the fused weights out of the state dict
+            fused_weight = new_state_dict.pop(key)
+            fused_bias = new_state_dict.pop(prefix + "in_proj_bias", None)
+            
+            # 1. Chunk the weight matrix into 3 equal parts (dim=0 is the output dimension)
+            q_w, k_w, v_w = fused_weight.chunk(3, dim=0)
+            
+            # Assign to the explicit layer names
+            new_state_dict[prefix + "q_proj.weight"] = q_w
+            new_state_dict[prefix + "k_proj.weight"] = k_w
+            new_state_dict[prefix + "v_proj.weight"] = v_w
+            
+            # 2. Chunk the bias vector if it exists
+            if fused_bias is not None:
+                q_b, k_b, v_b = fused_bias.chunk(3, dim=0)
+                new_state_dict[prefix + "q_proj.bias"] = q_b
+                new_state_dict[prefix + "k_proj.bias"] = k_b
+                new_state_dict[prefix + "v_proj.bias"] = v_b
+                
+            logger.info(f"Successfully converted fused attention weights for: {prefix}")
+            
+    return new_state_dict
 
 def load_jina_and_adapter(args, train_adapter=False):
         """
@@ -118,7 +155,7 @@ def load_jina_and_adapter(args, train_adapter=False):
         logger.info(f"Loading state_dict from {ADAPTER_RESUME_PATH}")
         old_state = load_file(ADAPTER_RESUME_PATH, device="cpu")
         
-        new_state = old_state            
+        new_state = convert_state_dict_for_explicit_attention(old_state)            
         adapter.load_state_dict(new_state, strict=False)
         
         if train_adapter:
