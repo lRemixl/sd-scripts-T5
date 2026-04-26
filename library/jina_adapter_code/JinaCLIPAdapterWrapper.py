@@ -53,7 +53,10 @@ class JinaAndAdapter(torch.nn.Module):
         """
         Forward pass from tokenized input to SDXL-compatible embeddings.
         """
-        
+        target_device = next(self.llm_adapter.parameters()).device
+        if hasattr(self.llm_model, 'model') and next(self.llm_model.model.parameters()).device != target_device:
+            self.llm_model.model.to(target_device)
+            
         if self.train_llm:
             jina_outputs = self.llm_model(captions)
             input_data = self._build_model_inputs(jina_outputs)
