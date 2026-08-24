@@ -503,11 +503,13 @@ def save_stable_diffusion_checkpoint(
     # Convert the UNet model
     update_sd("model.diffusion_model.", unet.state_dict())
 
-    # Convert the text encoders
-    update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
-
-    text_enc2_dict = convert_text_encoder_2_state_dict_to_sdxl(text_encoder2.state_dict(), logit_scale)
-    update_sd("conditioner.embedders.1.model.", text_enc2_dict)
+    # External-conditioning checkpoints (for example Jina plus its adapter)
+    # intentionally contain no SDXL CLIP towers.
+    if text_encoder1 is not None:
+        update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
+    if text_encoder2 is not None:
+        text_enc2_dict = convert_text_encoder_2_state_dict_to_sdxl(text_encoder2.state_dict(), logit_scale)
+        update_sd("conditioner.embedders.1.model.", text_enc2_dict)
 
     # Convert the VAE
     vae_dict = model_util.convert_vae_state_dict(vae.state_dict())

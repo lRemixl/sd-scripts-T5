@@ -28,6 +28,7 @@ import os
 import random
 import hashlib
 import subprocess
+import unicodedata
 from io import BytesIO
 import toml
 
@@ -142,6 +143,230 @@ IMAGE_TRANSFORMS = transforms.Compose(
 
 TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX = "_te_outputs.npz"
 
+ARTIST_TAG_PREFIXES = ("@ ", "by ")
+
+NATURAL_LANGUAGE_CAPTION_MD_FORMATS = ("_min_individual_md", "_character_thoughts", "_comic_md", "_long_thoughts")
+NATURAL_LANGUAGE_CAPTION_JSON_FORMATS = ("_min_individual_json", "_json_names", "_json_no_names")
+NATURAL_LANGUAGE_CAPTION_TEXT_FORMATS = ("_short", "_long_names", "_long_no_names")
+NATURAL_LANGUAGE_CAPTION_FORMATS = (
+    NATURAL_LANGUAGE_CAPTION_MD_FORMATS
+    + NATURAL_LANGUAGE_CAPTION_JSON_FORMATS
+    + NATURAL_LANGUAGE_CAPTION_TEXT_FORMATS
+)
+
+
+def natural_language_caption_format(absolute_path: str) -> Optional[str]:
+    """Return the natural-language format suffix encoded in an image filename."""
+    filename = os.path.basename(str(absolute_path or ""))
+    name_no_ext = os.path.splitext(filename)[0]
+    return next((fmt for fmt in NATURAL_LANGUAGE_CAPTION_FORMATS if name_no_ext.endswith(fmt)), None)
+
+
+def is_natural_language_caption_path(absolute_path: str) -> bool:
+    return natural_language_caption_format(absolute_path) is not None
+
+
+def is_artist_style_tag(token: str) -> bool:
+    normalized = str(token or "").strip().casefold()
+    return any(normalized.startswith(prefix) and normalized != prefix.strip() for prefix in ARTIST_TAG_PREFIXES)
+
+
+def extract_balance_artist_tags(caption: str, caption_separator: str = ",") -> List[str]:
+    """Return normalized ``@ artist`` tags used by subset repeat balancing."""
+    if not caption:
+        return []
+
+    separators = {",", "\n"}
+    if caption_separator:
+        separators.add(str(caption_separator))
+    split_pattern = "|".join(re.escape(separator) for separator in sorted(separators, key=len, reverse=True))
+
+    artists = set()
+    for unit in re.split(split_pattern, str(caption)):
+        unit = unit.strip()
+        match = re.search(r"(?i)(?:^|[.!?]\s+)(@\s+[^,\n]+?)\s*$", unit)
+        if not match:
+            continue
+        artist_name = unicodedata.normalize("NFKC", match.group(1)[1:])
+        artist_name = re.sub(r"\s+", " ", artist_name).strip().casefold()
+        if artist_name and artist_name != "@":
+            artists.add("@ " + artist_name)
+    return sorted(artists)
+
+
+def _replace_natural_language_wildcards(caption: str) -> str:
+    replacer1 = "__SD_SCRIPTS_ESCAPED_OPEN_BRACE__"
+    replacer2 = "__SD_SCRIPTS_ESCAPED_CLOSE_BRACE__"
+    while replacer1 in caption or replacer2 in caption:
+        replacer1 += "_"
+        replacer2 += "_"
+    caption = caption.replace("{{", replacer1).replace("}}", replacer2)
+    caption = re.sub(r"\{([^}]+)\}", lambda match: random.choice(match.group(1).split("|")), caption)
+    return caption.replace(replacer1, "{").replace(replacer2, "}")
+
+
+def _extract_natural_language_tags(text: str) -> Tuple[str, str]:
+    """Split prose from a trailing booru-style tag field when one is present."""
+    rating_match = re.search(r"(?i)(?<!\w)Rating:", text)
+    if rating_match is not None:
+        rating_idx = rating_match.start()
+    else:
+        marker_pattern = (
+            r"(?im)(?:^|[,\n])\s*"
+            r"(?:masterpiece|best quality|low quality|worst quality|newest|new|oldest|old)"
+            r"(?=\s*(?:,|$))"
+        )
+        marker_matches = list(re.finditer(marker_pattern, text))
+        rating_idx = marker_matches[0].start() if marker_matches else -1
+
+    if rating_idx == -1:
+        artist_matches = list(
+            re.finditer(
+                r"(?i)(?:^|[.!?]\s+|[,\n]\s*)((?:@ |by )[^,\n]+)(?=\s*(?:,|$))",
+                text,
+            )
+        )
+        rating_idx = artist_matches[-1].start(1) if artist_matches else -1
+
+    if rating_idx != -1:
+        boundary = max(text.rfind(".", 0, rating_idx), text.rfind("\n", 0, rating_idx))
+        if boundary != -1:
+            return text[: boundary + 1].strip(), text[boundary + 1 :].strip().lstrip(" ,.-")
+        return "", text.strip()
+
+    last_newline = text.rfind("\n")
+    if last_newline != -1:
+        trailing = text[last_newline + 1 :].strip()
+        if trailing.count(",") >= 1 and not trailing.endswith("."):
+            return text[:last_newline].strip(), trailing
+
+    last_period = text.rfind(".")
+    if last_period != -1:
+        trailing = text[last_period + 1 :].strip()
+        if trailing.count(",") >= 1:
+            return text[: last_period + 1].strip(), trailing
+    return text, ""
+
+
+def _shuffle_natural_language_sentences(text: str, subset) -> str:
+    if not text:
+        return text
+    parts = re.split(r"([.!?]+(?:\s+|$))", text)
+    sentences = [parts[index] + parts[index + 1] for index in range(0, len(parts) - 1, 2)]
+    if len(parts) % 2 != 0 and parts[-1].strip():
+        sentences.append(parts[-1])
+    sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+    if subset.caption_tag_dropout_rate > 0:
+        sentences = [
+            sentence for sentence in sentences if random.random() >= subset.caption_tag_dropout_rate
+        ]
+    if subset.shuffle_caption:
+        random.shuffle(sentences)
+    return " ".join(sentences)
+
+
+def _shuffle_natural_language_lists_and_paragraphs(text: str, subset) -> str:
+    shuffled_paragraphs = []
+    for paragraph in text.split("\n\n"):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        if re.search(r"(?m)^(-\s|\d+\.\s)", paragraph):
+            markers = list(re.finditer(r"(?m)^(-\s|\d+\.\s)", paragraph))
+            preamble = paragraph[: markers[0].start()].strip()
+            preamble = _shuffle_natural_language_sentences(preamble, subset) if preamble else ""
+            items = []
+            for index, match in enumerate(markers):
+                end = markers[index + 1].start() if index + 1 < len(markers) else len(paragraph)
+                items.append(paragraph[match.start() : end].strip())
+            if subset.caption_tag_dropout_rate > 0:
+                items = [item for item in items if random.random() >= subset.caption_tag_dropout_rate]
+            if subset.shuffle_caption:
+                random.shuffle(items)
+            result = ([preamble] if preamble else []) + items
+            if result:
+                shuffled_paragraphs.append("\n".join(result))
+        else:
+            paragraph = _shuffle_natural_language_sentences(paragraph, subset)
+            if paragraph:
+                shuffled_paragraphs.append(paragraph)
+    if subset.shuffle_caption:
+        random.shuffle(shuffled_paragraphs)
+    return "\n\n".join(shuffled_paragraphs)
+
+
+def _shuffle_natural_language_h2(text: str, subset) -> str:
+    headings = list(re.finditer(r"(?m)^##\s+[^\n]+", text))
+    if not headings:
+        return _shuffle_natural_language_lists_and_paragraphs(text, subset)
+    preamble = text[: headings[0].start()].strip()
+    preamble = _shuffle_natural_language_lists_and_paragraphs(preamble, subset) if preamble else ""
+    blocks = []
+    for index, match in enumerate(headings):
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        content = _shuffle_natural_language_lists_and_paragraphs(text[match.end() : end].strip(), subset)
+        blocks.append((match.group(0), content))
+    if subset.shuffle_caption:
+        random.shuffle(blocks)
+    result = [preamble] if preamble else []
+    for heading, content in blocks:
+        if content:
+            result.extend((heading, content))
+    return "\n".join(result)
+
+
+def _shuffle_natural_language_markdown(text: str, subset) -> str:
+    headings = list(re.finditer(r"(?m)^(?:\d+\.\s*)?#\s+(?:\d+\.)?[^\n]+", text))
+    if not headings:
+        return _shuffle_natural_language_h2(text, subset)
+    preamble = text[: headings[0].start()].strip()
+    preamble = _shuffle_natural_language_h2(preamble, subset) if preamble else ""
+    blocks = []
+    for index, match in enumerate(headings):
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        content = _shuffle_natural_language_h2(text[match.end() : end].strip(), subset)
+        blocks.append((match.group(0), content))
+    if subset.shuffle_caption:
+        random.shuffle(blocks)
+    result = [preamble] if preamble else []
+    for heading, content in blocks:
+        if content:
+            result.extend((heading, content))
+    return "\n\n".join(result)
+
+
+def _shuffle_natural_language_json(text: str, subset) -> str:
+    fields = list(re.finditer(r"(?m)^[\w\s_-]+:", text))
+    if not fields:
+        return _shuffle_natural_language_sentences(text, subset)
+    preamble = text[: fields[0].start()].strip()
+    preamble = _shuffle_natural_language_sentences(preamble, subset) if preamble else ""
+    blocks = []
+    for index, match in enumerate(fields):
+        end = fields[index + 1].start() if index + 1 < len(fields) else len(text)
+        value = _shuffle_natural_language_sentences(text[match.end() : end].strip(), subset)
+        if value:
+            blocks.append(f"{match.group(0)} {value}")
+    if subset.shuffle_caption:
+        random.shuffle(blocks)
+    return "\n".join(([preamble] if preamble else []) + blocks)
+
+
+def process_natural_language_caption(subset, caption: str, matched_format: str) -> Tuple[str, str]:
+    """Process structured prose while leaving its trailing tags for the normal tag pipeline."""
+    if subset.enable_wildcard:
+        caption = _replace_natural_language_wildcards(caption)
+    description, tags = _extract_natural_language_tags(caption)
+    if matched_format in NATURAL_LANGUAGE_CAPTION_MD_FORMATS:
+        description = _shuffle_natural_language_markdown(description, subset)
+    elif matched_format in NATURAL_LANGUAGE_CAPTION_JSON_FORMATS:
+        description = _shuffle_natural_language_json(description, subset)
+    elif matched_format == "_short":
+        description = _shuffle_natural_language_sentences(description, subset)
+    else:
+        description = _shuffle_natural_language_lists_and_paragraphs(description, subset)
+    return description, tags
+
 
 class ImageInfo:
     def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
@@ -166,6 +391,84 @@ class ImageInfo:
         self.text_encoder_outputs2: Optional[torch.Tensor] = None
         self.text_encoder_pool2: Optional[torch.Tensor] = None
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
+
+
+def apply_artist_balance_repeats(image_infos: Sequence[ImageInfo], subset) -> Dict[str, object]:
+    """Increase per-image repeats to balance ``@ artist`` frequencies within one subset."""
+    setting = getattr(subset, "artist_balance_repeats", False)
+    if not setting:
+        return {"enabled": False, "added_repeats": 0, "artist_count": 0}
+
+    max_multiplier = None if setting is True else int(setting)
+    if max_multiplier is not None and max_multiplier < 1:
+        raise ValueError("artist_balance_repeats must be false, true, or a positive integer")
+
+    images_by_artist: Dict[str, List[ImageInfo]] = {}
+    for info in image_infos:
+        artists = extract_balance_artist_tags(info.caption, getattr(subset, "caption_separator", ","))
+        for artist in artists:
+            images_by_artist.setdefault(artist, []).append(info)
+
+    if not images_by_artist:
+        logger.warning(
+            "artist_balance_repeats is enabled for subset %r, but no '@ artist' caption tags were found.",
+            getattr(subset, "image_dir", None) or getattr(subset, "metadata_file", None),
+        )
+        return {"enabled": True, "added_repeats": 0, "artist_count": 0}
+
+    target_count = max(len(infos) for infos in images_by_artist.values())
+    multipliers = {info.image_key: 1 for info in image_infos}
+
+    # Divide each artist's target evenly over its images. The stable hash keeps
+    # any remainder assignment deterministic across launches.
+    for artist, artist_infos in sorted(images_by_artist.items()):
+        artist_infos = sorted(
+            artist_infos,
+            key=lambda info: hashlib.sha256(f"{artist}\0{info.image_key}".encode("utf-8")).digest(),
+        )
+        artist_target = target_count
+        if max_multiplier is not None:
+            artist_target = min(artist_target, len(artist_infos) * max_multiplier)
+        quotient, remainder = divmod(artist_target, len(artist_infos))
+        for index, info in enumerate(artist_infos):
+            multiplier = quotient + (1 if index < remainder else 0)
+            multipliers[info.image_key] = max(multipliers[info.image_key], multiplier)
+
+    added_repeats = 0
+    base_repeats = int(getattr(subset, "num_repeats", 1))
+    for info in image_infos:
+        old_repeats = info.num_repeats
+        info.num_repeats = base_repeats * multipliers[info.image_key]
+        added_repeats += info.num_repeats - old_repeats
+
+    effective_counts = {
+        artist: sum(info.num_repeats for info in infos) for artist, infos in images_by_artist.items()
+    }
+    source_counts = {artist: len(infos) for artist, infos in images_by_artist.items()}
+    summary = {
+        "enabled": True,
+        "artist_count": len(images_by_artist),
+        "source_min": min(source_counts.values()),
+        "source_max": max(source_counts.values()),
+        "effective_min": min(effective_counts.values()),
+        "effective_max": max(effective_counts.values()),
+        "added_repeats": added_repeats,
+        "max_multiplier": max_multiplier,
+    }
+    logger.info(
+        "artist repeat balancing for subset %r: artists=%d, source_count=%d..%d, "
+        "effective_count=%d..%d, added_samples=%d, multiplier_cap=%s",
+        getattr(subset, "image_dir", None) or getattr(subset, "metadata_file", None),
+        summary["artist_count"],
+        summary["source_min"],
+        summary["source_max"],
+        summary["effective_min"],
+        summary["effective_max"],
+        summary["added_repeats"],
+        summary["max_multiplier"] if summary["max_multiplier"] is not None else "none",
+    )
+    subset.artist_balance_summary = summary
+    return summary
 
 
 class BucketManager:
@@ -390,6 +693,7 @@ class BaseSubset:
         image_dir: Optional[str],
         alpha_mask: Optional[bool],
         num_repeats: int,
+        artist_balance_repeats: Union[bool, int],
         shuffle_caption: bool,
         caption_separator: str,
         keep_tokens: int,
@@ -403,6 +707,7 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        artist_tag_dropout_rate: float,
         caption_prefix: Optional[str],
         caption_suffix: Optional[str],
         token_warmup_min: int,
@@ -411,6 +716,12 @@ class BaseSubset:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
         self.num_repeats = num_repeats
+        if not isinstance(artist_balance_repeats, (bool, int)) or (
+            not isinstance(artist_balance_repeats, bool) and artist_balance_repeats < 0
+        ):
+            raise ValueError("artist_balance_repeats must be false, true, or a non-negative integer")
+        self.artist_balance_repeats = artist_balance_repeats
+        self.artist_balance_summary = None
         self.shuffle_caption = shuffle_caption
         self.caption_separator = caption_separator
         self.keep_tokens = keep_tokens
@@ -424,6 +735,9 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        if not 0.0 <= artist_tag_dropout_rate <= 1.0:
+            raise ValueError("artist_tag_dropout_rate must be between 0.0 and 1.0")
+        self.artist_tag_dropout_rate = artist_tag_dropout_rate
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
 
@@ -444,6 +758,7 @@ class DreamBoothSubset(BaseSubset):
         latents_only: bool,
         alpha_mask: bool,
         num_repeats,
+        artist_balance_repeats,
         shuffle_caption,
         caption_separator: str,
         keep_tokens,
@@ -457,6 +772,7 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        artist_tag_dropout_rate,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -468,6 +784,7 @@ class DreamBoothSubset(BaseSubset):
             image_dir,
             alpha_mask,
             num_repeats,
+            artist_balance_repeats,
             shuffle_caption,
             caption_separator,
             keep_tokens,
@@ -481,6 +798,7 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            artist_tag_dropout_rate,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -508,6 +826,7 @@ class FineTuningSubset(BaseSubset):
         metadata_file: str,
         alpha_mask: bool,
         num_repeats,
+        artist_balance_repeats,
         shuffle_caption,
         caption_separator,
         keep_tokens,
@@ -521,6 +840,7 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        artist_tag_dropout_rate,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -532,6 +852,7 @@ class FineTuningSubset(BaseSubset):
             image_dir,
             alpha_mask,
             num_repeats,
+            artist_balance_repeats,
             shuffle_caption,
             caption_separator,
             keep_tokens,
@@ -545,6 +866,7 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            artist_tag_dropout_rate,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -567,6 +889,7 @@ class ControlNetSubset(BaseSubset):
         caption_extension: str,
         cache_info: bool,
         num_repeats,
+        artist_balance_repeats,
         shuffle_caption,
         caption_separator,
         keep_tokens,
@@ -580,6 +903,7 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        artist_tag_dropout_rate,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -591,6 +915,7 @@ class ControlNetSubset(BaseSubset):
             image_dir,
             False,  # alpha_mask
             num_repeats,
+            artist_balance_repeats,
             shuffle_caption,
             caption_separator,
             keep_tokens,
@@ -604,6 +929,7 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            artist_tag_dropout_rate,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -755,7 +1081,7 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
-    def process_caption(self, subset: BaseSubset, caption):
+    def process_caption(self, subset: BaseSubset, caption, absolute_path: str = ""):
         # caption に prefix/suffix を付ける
         if subset.caption_prefix:
             caption = subset.caption_prefix + " " + caption
@@ -779,8 +1105,13 @@ class BaseDataset(torch.utils.data.Dataset):
                 )
             caption = ""
         else:
+            matched_format = natural_language_caption_format(absolute_path)
+            description = ""
+            if matched_format is not None:
+                description, caption = process_natural_language_caption(subset, caption, matched_format)
+
             # process wildcards
-            if subset.enable_wildcard:
+            if matched_format is None and subset.enable_wildcard:
                 # if caption is multiline, random choice one line
                 if "\n" in caption:
                     caption = random.choice(caption.split("\n"))
@@ -803,11 +1134,17 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 # unescape the curly braces
                 caption = caption.replace(replacer1, "{").replace(replacer2, "}")
-            else:
+            elif matched_format is None:
                 # if caption is multiline, use the first line
                 caption = caption.split("\n")[0]
 
-            if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
+            artist_tag_dropout_rate = getattr(subset, "artist_tag_dropout_rate", 0.0)
+            if (
+                subset.shuffle_caption
+                or subset.token_warmup_step > 0
+                or subset.caption_tag_dropout_rate > 0
+                or artist_tag_dropout_rate > 0
+            ):
                 original_caption = caption
                 fixed_tokens = []
                 flex_tokens = []
@@ -850,7 +1187,22 @@ class BaseDataset(torch.utils.data.Dataset):
                             self._protected_tags = {line.strip().lower() for line in f if line.strip()}
                         logger.info(f"Loaded {len(self._protected_tags)} protected tags.")
 
-                log_tag_dropout = self.log_caption_tag_dropout and subset.caption_tag_dropout_rate > 0
+                log_tag_dropout = self.log_caption_tag_dropout and (
+                    subset.caption_tag_dropout_rate > 0 or artist_tag_dropout_rate > 0
+                )
+
+                def dropout_artist_tags(tokens, record_details=False):
+                    if artist_tag_dropout_rate <= 0:
+                        return tokens, []
+                    kept = []
+                    dropped_tokens = []
+                    for token in tokens:
+                        if is_artist_style_tag(token) and random.random() < artist_tag_dropout_rate:
+                            if record_details:
+                                dropped_tokens.append(token)
+                        else:
+                            kept.append(token)
+                    return kept, dropped_tokens
 
                 def dropout_tags(tokens, record_details=False):
                     if subset.caption_tag_dropout_rate <= 0:
@@ -859,7 +1211,12 @@ class BaseDataset(torch.utils.data.Dataset):
                     protected_tokens = []
                     dropped_tokens = []
                     for token in tokens:
-                        is_protected = token.lower() in self._protected_tags
+                        normalized_token = token.strip().casefold()
+                        # Once the per-subset artist rate is active, artist tags
+                        # are governed exclusively by that rate. The normal tag
+                        # dropout must not get a second chance to remove them.
+                        artist_rate_controls_token = artist_tag_dropout_rate > 0 and is_artist_style_tag(token)
+                        is_protected = normalized_token in self._protected_tags or artist_rate_controls_token
                         if is_protected or random.random() >= subset.caption_tag_dropout_rate:
                             kept.append(token)
                             if record_details and is_protected:
@@ -871,19 +1228,43 @@ class BaseDataset(torch.utils.data.Dataset):
                 if subset.shuffle_caption:
                     random.shuffle(flex_tokens)
 
+                before_dropout_tokens = fixed_tokens + flex_tokens + fixed_suffix_tokens
+                fixed_tokens, fixed_artist_drops = dropout_artist_tags(fixed_tokens, log_tag_dropout)
+                flex_tokens, flex_artist_drops = dropout_artist_tags(flex_tokens, log_tag_dropout)
+                fixed_suffix_tokens, fixed_suffix_artist_drops = dropout_artist_tags(
+                    fixed_suffix_tokens, log_tag_dropout
+                )
+                artist_dropped_tokens = fixed_artist_drops + flex_artist_drops + fixed_suffix_artist_drops
+
                 if log_tag_dropout:
-                    before_dropout_tokens = list(flex_tokens)
                     flex_tokens, protected_tokens, dropped_tokens = dropout_tags(flex_tokens, True)
                     logger.info("Caption tag dropout details:")
                     logger.info(f"  Original caption: \"{original_caption}\"")
                     logger.info(f"  Tokens before dropout: {before_dropout_tokens}")
                     logger.info(f"  Protected tokens kept: {protected_tokens}")
-                    logger.info(f"  Dropped tokens: {dropped_tokens}")
-                    logger.info(f"  Tokens after dropout: {flex_tokens}")
+                    logger.info(f"  Artist tags dropped: {artist_dropped_tokens}")
+                    logger.info(f"  Other tags dropped: {dropped_tokens}")
+                    logger.info(f"  Tokens after dropout: {fixed_tokens + flex_tokens + fixed_suffix_tokens}")
                 else:
                     flex_tokens, _, _ = dropout_tags(flex_tokens, False)
 
                 caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+
+            if matched_format is not None:
+                if len(description) + len(caption) > 2500:
+                    if caption:
+                        tags = [tag.strip() for tag in caption.split(",")]
+                        if subset.shuffle_caption:
+                            random.shuffle(tags)
+                        caption = ", ".join(tag for tag in tags if tag)
+                    description = re.sub(r"\n{3,}", "\n\n", description).strip()
+                    caption = caption + "\n" + description if caption else description
+                else:
+                    description = re.sub(r"\n{3,}", "\n\n", description).strip()
+                    if matched_format in NATURAL_LANGUAGE_CAPTION_JSON_FORMATS:
+                        caption = description + "\n" + caption if caption else description
+                    else:
+                        caption = description + (" " + caption if caption else "")
 
             # process secondary separator
             if subset.secondary_separator:
@@ -1088,8 +1469,15 @@ class BaseDataset(torch.utils.data.Dataset):
 
         image_infos = list(self.image_data.values())
 
-        # sort by resolution
-        image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
+        # Sort by the complete condition used to flush batches below. Sorting
+        # only by area can interleave equal-area portrait/landscape buckets or
+        # augmentation modes and fragment them into tiny partial batches.
+        image_infos.sort(
+            key=lambda info: latent_cache_batch_sort_key(
+                info,
+                self.image_to_subset[info.image_key],
+            )
+        )
 
         # split by resolution and some conditions
         class Condition:
@@ -1438,7 +1826,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 text_encoder_pool2_list.append(text_encoder_pool2)
                 captions.append(caption)
             else:
-                caption = self.process_caption(subset, image_info.caption)
+                caption = self.process_caption(subset, image_info.caption, image_info.absolute_path)
                 if self.XTI_layers:
                     caption_layer = []
                     for layer in self.XTI_layers:
@@ -1808,20 +2196,23 @@ class DreamBoothDataset(BaseDataset):
                 )
                 continue
 
-            if subset.is_reg:
-                num_reg_images += subset.num_repeats * len(img_paths)
-            else:
-                num_train_images += subset.num_repeats * len(img_paths)
-
+            subset_image_infos = []
             for img_path, caption, size in zip(img_paths, captions, sizes):
                 info = ImageInfo(img_path, subset.num_repeats, caption, subset.is_reg, img_path)
                 if size is not None:
                     info.image_size = size
                 if subset.latents_only:
                     info.latents_npz = img_path  # path is already the .npz file
-                if subset.is_reg:
-                    reg_infos.append((info, subset))
-                else:
+                subset_image_infos.append(info)
+
+            apply_artist_balance_repeats(subset_image_infos, subset)
+            subset_repeat_count = sum(info.num_repeats for info in subset_image_infos)
+            if subset.is_reg:
+                num_reg_images += subset_repeat_count
+                reg_infos.extend((info, subset) for info in subset_image_infos)
+            else:
+                num_train_images += subset_repeat_count
+                for info in subset_image_infos:
                     self.register_image(info, subset)
 
             subset.img_count = len(img_paths)
@@ -1906,6 +2297,7 @@ class FineTuningDataset(BaseDataset):
                 continue
 
             tags_list = []
+            subset_image_infos = []
             for image_key, img_md in metadata.items():
                 # path情報を作る
                 abs_path = None
@@ -1962,9 +2354,12 @@ class FineTuningDataset(BaseDataset):
                     # if npz exists, use them
                     image_info.latents_npz, image_info.latents_npz_flipped = self.image_key_to_npz_file(subset, image_key)
 
-                self.register_image(image_info, subset)
+                subset_image_infos.append(image_info)
 
-            self.num_train_images += len(metadata) * subset.num_repeats
+            apply_artist_balance_repeats(subset_image_infos, subset)
+            for image_info in subset_image_infos:
+                self.register_image(image_info, subset)
+            self.num_train_images += sum(image_info.num_repeats for image_info in subset_image_infos)
 
             # TODO do not record tag freq when no tag
             self.set_tag_frequency(os.path.basename(subset.metadata_file), tags_list)
@@ -2114,6 +2509,7 @@ class ControlNetDataset(BaseDataset):
                 subset.cache_info,
                 False,
                 subset.num_repeats,
+                subset.artist_balance_repeats,
                 subset.shuffle_caption,
                 subset.caption_separator,
                 subset.keep_tokens,
@@ -2127,6 +2523,7 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_dropout_rate,
                 subset.caption_dropout_every_n_epochs,
                 subset.caption_tag_dropout_rate,
+                subset.artist_tag_dropout_rate,
                 subset.caption_prefix,
                 subset.caption_suffix,
                 subset.token_warmup_min,
@@ -2336,6 +2733,19 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def disable_token_padding(self):
         for dataset in self.datasets:
             dataset.disable_token_padding()
+
+
+def latent_cache_batch_sort_key(image_info, subset):
+    """Group cache inputs by their complete tensor and augmentation condition."""
+    width, height = image_info.bucket_reso
+    return (
+        width * height,
+        width,
+        height,
+        bool(subset.flip_aug),
+        bool(subset.alpha_mask),
+        bool(subset.random_crop),
+    )
 
 
 def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alpha_mask: bool):
@@ -3471,8 +3881,11 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--max_token_length",
         type=int,
         default=None,
-        choices=[None, 150, 225],
-        help="max token length of text encoder (default for 75, 150 or 225) / text encoderのトークンの最大長（未指定で75、150または225が指定可）",
+        choices=[None, 150, 225, 300, 512, 1024, 2048],
+        help=(
+            "max token length of text encoder (75 by default; Jina CLIP v2 commonly uses 512 or 1024) / "
+            "text encoderのトークンの最大長"
+        ),
     )
     parser.add_argument(
         "--mem_eff_attn",
@@ -5616,6 +6029,35 @@ def _scipy_assignment(cost: torch.Tensor):
     return cost, (row, col)
 
 
+def flow_sigmas_to_timesteps(sigmas: torch.Tensor, num_train_timesteps: int) -> torch.Tensor:
+    """Map an RF sigma to the SDXL U-Net's continuous timestep convention."""
+    timestep_count = int(num_train_timesteps)
+    if timestep_count <= 0:
+        raise ValueError("num_train_timesteps must be positive.")
+    sigma_values = torch.as_tensor(
+        sigmas, device=sigmas.device if isinstance(sigmas, torch.Tensor) else None, dtype=torch.float32
+    )
+    return sigma_values * float(timestep_count)
+
+
+def get_flow_huber_c(args, sigmas: torch.Tensor, device: torch.device) -> Optional[torch.Tensor]:
+    """Compute a Huber threshold from the exact RF sigma without a DDPM lookup."""
+    if args.loss_type == "l2":
+        return None
+    if args.loss_type not in ("huber", "smooth_l1"):
+        raise NotImplementedError(f"Unknown loss type {args.loss_type}")
+
+    sigma_values = torch.as_tensor(sigmas, device=device, dtype=torch.float32)
+    huber_c = float(args.huber_c)
+    if args.huber_schedule == "exponential":
+        return torch.pow(torch.full_like(sigma_values, huber_c), sigma_values)
+    if args.huber_schedule == "snr":
+        return (1.0 - huber_c) * (1.0 - sigma_values).square() + huber_c
+    if args.huber_schedule == "constant":
+        return torch.full_like(sigma_values, huber_c)
+    raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
+
+
 def get_noise_noisy_latents_and_timesteps(
     args,
     noise_scheduler,
@@ -5676,16 +6118,22 @@ def get_noise_noisy_latents_and_timesteps(
             t_ref = sigmas
             sigmas = ratios * t_ref / (1 + (ratios - 1) * t_ref)
 
-        timesteps = torch.clamp((sigmas * timestep_max).long(), 0, timestep_max - 1)
-        _, huber_c = get_timesteps_and_huber_c(
-            args,
-            0,
-            noise_scheduler.config.num_train_timesteps,
-            noise_scheduler,
-            b_size,
-            latents.device,
-            timesteps_override=timesteps,
-        )
+        if getattr(args, "flow_continuous_timesteps", False):
+            # SDXL's sinusoidal embedding accepts fractional timesteps. Keeping
+            # this continuous makes t / N exactly match the sigma used for x_t.
+            timesteps = flow_sigmas_to_timesteps(sigmas, timestep_max)
+            huber_c = get_flow_huber_c(args, sigmas, latents.device)
+        else:
+            timesteps = torch.clamp((sigmas * timestep_max).long(), 0, timestep_max - 1)
+            _, huber_c = get_timesteps_and_huber_c(
+                args,
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                noise_scheduler,
+                b_size,
+                latents.device,
+                timesteps_override=timesteps,
+            )
     else:
         min_timestep = 0 if args.min_timestep is None else args.min_timestep
         max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep

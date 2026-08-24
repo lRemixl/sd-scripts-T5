@@ -131,7 +131,7 @@ def main():
         from diffusers import AutoencoderKL
         vae = AutoencoderKL.from_pretrained(target_path, subfolder="vae" if not args.vae else None, torch_dtype=vae_dtype)
             
-    vae.to(device, dtype=vae_dtype)
+    custom_sdxl_utils.move_custom_vae_to_device(vae, device, vae_dtype, args.vae_type)
     # Channels Last Optimization for NVIDIA GPUs (especially 4090 with Tensor Cores)
     vae.to(memory_format=torch.channels_last)
     vae.requires_grad_(False)

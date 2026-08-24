@@ -482,7 +482,7 @@ def cache_latents(args: argparse.Namespace) -> None:
             pass
     torch.backends.cudnn.benchmark = True
 
-    vae.to(accelerator.device, dtype=vae_dtype)
+    custom_sdxl_utils.move_custom_vae_to_device(vae, accelerator.device, vae_dtype, vae_type)
     vae.requires_grad_(False)
     vae.eval()
     

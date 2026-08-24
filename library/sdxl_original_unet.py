@@ -455,14 +455,14 @@ class CrossAttention(nn.Module):
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)
 
-        hidden_states = self._attention(query, key, value)
+        hidden_states = self._attention(query, key, value, mask)
 
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
         # hidden_states = self.to_out[1](hidden_states)     # no dropout
         return hidden_states
 
-    def _attention(self, query, key, value):
+    def _attention(self, query, key, value, mask=None):
         if self.upcast_attention:
             query = query.float()
             key = key.float()
@@ -474,6 +474,18 @@ class CrossAttention(nn.Module):
             beta=0,
             alpha=self.scale,
         )
+        if mask is not None:
+            if mask.dim() == 4:
+                mask = mask[:, 0, 0, :]
+            if mask.dim() != 2:
+                raise ValueError(f"cross-attention mask must be [B, K], got {tuple(mask.shape)}")
+            mask = mask.to(device=attention_scores.device, dtype=torch.bool)
+            heads = query.shape[0] // mask.shape[0]
+            expanded_mask = mask.repeat_interleave(heads, dim=0)[:, None, :]
+            attention_scores.masked_fill_(
+                ~expanded_mask,
+                -torch.finfo(attention_scores.dtype).max,
+            )
         attention_probs = attention_scores.softmax(dim=-1)
 
         # cast back to the original dtype
@@ -545,6 +557,10 @@ class CrossAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))
         del q_in, k_in, v_in
 
+        if mask is not None:
+            if mask.dim() == 2:
+                mask = mask[:, None, None, :]
+            mask = mask.to(device=q.device, dtype=torch.bool)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
 
         out = rearrange(out, "b h n d -> b n (h d)", h=h)
@@ -641,7 +657,7 @@ class BasicTransformerBlock(nn.Module):
         self.attn1.set_use_sdpa(sdpa)
         self.attn2.set_use_sdpa(sdpa)
 
-    def forward_body(self, hidden_states, context=None, timestep=None):
+    def forward_body(self, hidden_states, context=None, timestep=None, cross_attention_mask=None):
         # 1. Self-Attention
         norm_hidden_states = self.norm1(hidden_states)
 
@@ -649,14 +665,18 @@ class BasicTransformerBlock(nn.Module):
 
         # 2. Cross-Attention
         norm_hidden_states = self.norm2(hidden_states)
-        hidden_states = self.attn2(norm_hidden_states, context=context) + hidden_states
+        hidden_states = self.attn2(
+            norm_hidden_states,
+            context=context,
+            mask=cross_attention_mask,
+        ) + hidden_states
 
         # 3. Feed-forward
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
         return hidden_states
 
-    def forward(self, hidden_states, context=None, timestep=None):
+    def forward(self, hidden_states, context=None, timestep=None, cross_attention_mask=None):
         if self.training and self.gradient_checkpointing:
             # logger.info("BasicTransformerBlock: checkpointing")
 
@@ -667,10 +687,15 @@ class BasicTransformerBlock(nn.Module):
                 return custom_forward
 
             output = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(self.forward_body), hidden_states, context, timestep, use_reentrant=USE_REENTRANT
+                create_custom_forward(self.forward_body),
+                hidden_states,
+                context,
+                timestep,
+                cross_attention_mask,
+                use_reentrant=USE_REENTRANT,
             )
         else:
-            output = self.forward_body(hidden_states, context, timestep)
+            output = self.forward_body(hidden_states, context, timestep, cross_attention_mask)
 
         return output
 
@@ -730,7 +755,13 @@ class Transformer2DModel(nn.Module):
         for transformer in self.transformer_blocks:
             transformer.set_use_sdpa(sdpa)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        timestep=None,
+        cross_attention_mask=None,
+    ):
         # 1. Input
         batch, _, height, weight = hidden_states.shape
         residual = hidden_states
@@ -747,7 +778,12 @@ class Transformer2DModel(nn.Module):
 
         # 2. Blocks
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, context=encoder_hidden_states, timestep=timestep)
+            hidden_states = block(
+                hidden_states,
+                context=encoder_hidden_states,
+                timestep=timestep,
+                cross_attention_mask=cross_attention_mask,
+            )
 
         # 3. Output
         if not self.use_linear_projection:
@@ -1072,6 +1108,7 @@ class SdxlUNet2DConditionModel(nn.Module):
     # endregion
 
     def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+        cross_attention_mask = kwargs.get("cross_attention_mask", None)
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])
 
@@ -1092,7 +1129,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 if isinstance(layer, ResnetBlock2D):
                     x = layer(x, emb)
                 elif isinstance(layer, Transformer2DModel):
-                    x = layer(x, context)
+                    x = layer(x, context, cross_attention_mask=cross_attention_mask)
                 else:
                     x = layer(x)
             return x
@@ -1161,6 +1198,7 @@ class InferSdxlUNet2DConditionModel:
         current implementation is a copy of `SdxlUNet2DConditionModel.forward()` with Deep Shrink.
         """
         _self = self.delegate
+        cross_attention_mask = kwargs.get("cross_attention_mask", None)
 
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])
@@ -1182,7 +1220,7 @@ class InferSdxlUNet2DConditionModel:
                 if isinstance(layer, ResnetBlock2D):
                     x = layer(x, emb)
                 elif isinstance(layer, Transformer2DModel):
-                    x = layer(x, context)
+                    x = layer(x, context, cross_attention_mask=cross_attention_mask)
                 else:
                     x = layer(x)
             return x

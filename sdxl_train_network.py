@@ -73,7 +73,11 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             accelerator.device,
             weight_dtype,
             custom_vae_type=vae_type,
-            latent_channels_override=latent_channels
+            latent_channels_override=latent_channels,
+            load_text_encoders=not bool(
+                getattr(args, "use_llm_as_text_encoder", False)
+                and getattr(args, "adapter_jina", False)
+            ),
         )
         
         # Load Stable Diffusion Format flag is not returned by custom func, but implied by path check?
@@ -128,6 +132,14 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         else:
              super().cache_latents(args, accelerator, vae, unet, train_dataset_group, vae_dtype)
 
+    def move_vae_to_device(self, args, vae, device, dtype):
+        return custom_sdxl_utils.move_custom_vae_to_device(
+            vae,
+            device,
+            dtype,
+            getattr(args, "vae_type", None),
+        )
+
     def load_tokenizer(self, args):
         tokenizer = sdxl_train_util.load_tokenizers(args)
         return tokenizer
@@ -152,6 +164,13 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
     def cache_text_encoder_outputs_if_needed(
         self, args, accelerator, unet, vae, tokenizers, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
     ):
+        if getattr(args, "use_llm_as_text_encoder", False):
+            self.move_jina_text_encoder_to_device(
+                text_encoders,
+                accelerator.device,
+                weight_dtype,
+            )
+            return
         if args.cache_text_encoder_outputs:
             if not args.lowram:
                 # メモリ消費を減らす
@@ -187,6 +206,18 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             text_encoders[1].to(accelerator.device, dtype=weight_dtype)
 
     def get_text_cond(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype):
+        if getattr(args, "use_llm_as_text_encoder", False):
+            wrapper = self.get_jina_text_encoder(text_encoders)
+            with self.fp32_adapter_autocast_disabled(accelerator):
+                prompt_embeds, pooled_prompt_embeds, attention_mask = wrapper(
+                    batch["captions"],
+                    return_attention_mask=True,
+                )
+            return {
+                "prompt_embeds": prompt_embeds,
+                "pooled_prompt_embeds": pooled_prompt_embeds,
+                "attention_mask": attention_mask,
+            }
         if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
             input_ids1 = batch["input_ids"]
             input_ids2 = batch["input_ids2"]
@@ -251,14 +282,36 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
 
         # concat embeddings
-        encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
-        vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+        if getattr(args, "use_llm_as_text_encoder", False):
+            text_embedding = text_conds["prompt_embeds"].to(weight_dtype)
+            vector_embedding = torch.cat(
+                [text_conds["pooled_prompt_embeds"], embs],
+                dim=1,
+            ).to(weight_dtype)
+            cross_attention_mask = train_network.prepare_jina_adapter_cross_attention_mask(
+                args,
+                text_conds,
+                text_embedding,
+                accelerator.device,
+            )
+        else:
+            encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
+            vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+            text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+            cross_attention_mask = None
 
-        noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
+        noise_pred = unet(
+            noisy_latents,
+            timesteps,
+            text_embedding,
+            vector_embedding,
+            cross_attention_mask=cross_attention_mask,
+        )
         return noise_pred
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
+        if getattr(args, "use_llm_as_text_encoder", False):
+            return
         sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
 

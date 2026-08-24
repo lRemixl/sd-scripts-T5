@@ -4,7 +4,7 @@ import argparse
 import math
 import os
 from multiprocessing import Value
-from typing import List
+from typing import Dict, List
 import toml
 
 from tqdm import tqdm
@@ -51,9 +51,394 @@ from library.custom_train_functions import (
     apply_masked_loss,
 )
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
+from safetensors.torch import load_file, save_file
+
+from library.transformers_compat import load_jina_clip_tokenizer
+from llm_adapter_lib.jina.jina_clip_v2_states import JinaStates
+from llm_adapter_lib.jina.jina_to_sdxl_adapter_v2 import JinaToSDXLAdapterV2
+from llm_adapter_lib.jina.jina_to_sdxl_adapter_v3 import (
+    JinaToSDXLAdapterV3,
+    filter_compatible_adapter_state_dict,
+    missing_or_mismatched_v3_keys,
+)
 
 
 UNET_NUM_BLOCKS_FOR_BLOCK_LR = 23
+
+
+def _nonfinite_tensor_summary(name, tensor):
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    detached = tensor.detach()
+    finite = torch.isfinite(detached)
+    if bool(finite.all()):
+        return None
+    nan_count = int(torch.isnan(detached).sum().item())
+    inf_count = int(torch.isinf(detached).sum().item())
+    finite_values = detached[finite]
+    finite_range = "no finite values"
+    if finite_values.numel() > 0:
+        finite_range = (
+            f"finite_min={finite_values.min().item():.6g}, "
+            f"finite_max={finite_values.max().item():.6g}"
+        )
+    return (
+        f"{name}: shape={tuple(detached.shape)}, dtype={detached.dtype}, "
+        f"nan={nan_count}, inf={inf_count}, {finite_range}"
+    )
+
+
+def convert_state_dict_for_explicit_attention(state_dict):
+    """Convert legacy fused MHA q/k/v tensors to the adapter's explicit linears."""
+    converted = state_dict.copy()
+    for key in list(converted.keys()):
+        if not key.endswith("in_proj_weight"):
+            continue
+        prefix = key[: -len("in_proj_weight")]
+        fused_weight = converted.pop(key)
+        fused_bias = converted.pop(prefix + "in_proj_bias", None)
+        q_weight, k_weight, v_weight = fused_weight.chunk(3, dim=0)
+        converted[prefix + "q_proj.weight"] = q_weight
+        converted[prefix + "k_proj.weight"] = k_weight
+        converted[prefix + "v_proj.weight"] = v_weight
+        if fused_bias is not None:
+            q_bias, k_bias, v_bias = fused_bias.chunk(3, dim=0)
+            converted[prefix + "q_proj.bias"] = q_bias
+            converted[prefix + "k_proj.bias"] = k_bias
+            converted[prefix + "v_proj.bias"] = v_bias
+        logger.info("Converted fused attention weights for %s", prefix)
+    return converted
+
+
+def load_state_dict_with_report(module, state_dict, label, strict=False):
+    incompatible = module.load_state_dict(state_dict, strict=strict)
+    missing = list(getattr(incompatible, "missing_keys", []))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []))
+    if missing or unexpected:
+        logger.warning(
+            "%s checkpoint load: %d missing and %d unexpected keys.",
+            label,
+            len(missing),
+            len(unexpected),
+        )
+    else:
+        logger.info("%s checkpoint load matched all keys.", label)
+    return incompatible
+
+
+def save_llm_adapter(module: torch.nn.Module, output_dir: str, tag: str) -> str:
+    """Save the standalone Jina-to-SDXL adapter state dict."""
+    os.makedirs(output_dir, exist_ok=True)
+    adapter = module.module if hasattr(module, "module") else module
+    state = {key: value.detach().cpu() for key, value in adapter.state_dict().items()}
+    output_path = os.path.join(output_dir, f"llm_adapter-{tag}.safetensors")
+    save_file(state, output_path)
+    logger.info("Saved Jina adapter: %s", output_path)
+    return output_path
+
+
+def save_jina_clip(accelerator, jina_states, output_dir: str, tag: str) -> str:
+    """Save a selectively fine-tuned Jina model and its tokenizer in HF format."""
+    output_path = os.path.join(output_dir, f"jina_{tag}")
+    os.makedirs(output_path, exist_ok=True)
+    accelerator.unwrap_model(jina_states.model).save_pretrained(
+        output_path,
+        safe_serialization=True,
+    )
+    jina_states.tokenizer.save_pretrained(output_path)
+    logger.info("Saved fine-tuned Jina CLIP: %s", output_path)
+    return output_path
+
+
+class JinaAndAdapter(torch.nn.Module):
+    """Turn processed caption strings into SDXL sequence and pooled conditioning."""
+
+    def __init__(
+        self,
+        llm_model,
+        tokenizer,
+        llm_adapter,
+        should_train_llm=False,
+        log_text_inputs=False,
+        log_text_input_batches=1,
+        log_text_input_max_chars=4000,
+    ):
+        super().__init__()
+        self.llm_model = llm_model
+        self.tokenizer = tokenizer
+        self.llm_adapter = llm_adapter
+        self.train_llm = bool(should_train_llm)
+        self.log_text_inputs = bool(log_text_inputs)
+        self.log_text_input_batches = max(0, int(log_text_input_batches))
+        self.log_text_input_max_chars = max(0, int(log_text_input_max_chars))
+        self.logged_text_input_batches = 0
+        self.last_input_captions = ()
+        self._conditioning_finite_check_complete = False
+
+    @property
+    def device(self):
+        return next(self.llm_adapter.parameters()).device
+
+    def _log_text_input_batch(self, captions):
+        if not self.log_text_inputs or self.logged_text_input_batches >= self.log_text_input_batches:
+            return
+        self.logged_text_input_batches += 1
+        try:
+            summaries = self.llm_model.inspect_text_inputs(captions)
+        except Exception as exc:
+            logger.warning("Could not inspect Jina text inputs: %s", exc)
+            summaries = [{"text": str(caption)} for caption in captions]
+        for index, summary in enumerate(summaries):
+            text = summary["text"]
+            if self.log_text_input_max_chars and len(text) > self.log_text_input_max_chars:
+                text = text[: self.log_text_input_max_chars] + "...<truncated in log only>"
+            logger.info(
+                "Jina input [%d]: raw_tokens=%s retained_tokens=%s padded_tokens=%s truncated=%s text=%r",
+                index,
+                summary.get("raw_token_count", "unknown"),
+                summary.get("retained_token_count", "unknown"),
+                summary.get("padded_token_count", "unknown"),
+                summary.get("truncated", "unknown"),
+                text,
+            )
+
+    def _build_model_inputs(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        required_layers = getattr(self.llm_adapter, "required_hidden_state_layers", None)
+        if "jina_mean_pooled_state" not in batch:
+            raise KeyError("The Jina encoder did not return `jina_mean_pooled_state`.")
+
+        pooled = batch["jina_mean_pooled_state"]
+        if pooled.dim() > 2:
+            pooled = pooled.squeeze(0)
+        attention_mask = batch["attention_mask"]
+        if attention_mask.dim() > 2:
+            attention_mask = attention_mask.squeeze(0)
+        target_device = next(self.llm_adapter.parameters()).device
+        inputs = {
+            "jina_mean_pooled_state": pooled.float().to(target_device),
+            "attention_mask": attention_mask.long().to(target_device),
+        }
+
+        if required_layers:
+            state_key = getattr(
+                self.llm_adapter,
+                "hidden_state_input_key",
+                "jina_hidden_states_selected_layers",
+            )
+            if state_key not in batch:
+                raise KeyError(
+                    f"The selected adapter requires `{state_key}` for Jina layers {tuple(required_layers)}."
+                )
+            selected = batch[state_key]
+            if selected.dim() > 4:
+                selected = selected.squeeze(0)
+            inputs[state_key] = selected.float().to(target_device)
+        else:
+            hidden = batch["jina_hidden_states"]
+            if hidden.dim() > 3:
+                hidden = hidden.squeeze(0)
+            inputs["jina_hidden_states"] = hidden.float().to(target_device)
+        return inputs
+
+    def forward(self, captions, return_attention_mask: bool = False):
+        captions = [str(caption) for caption in captions]
+        self.last_input_captions = tuple(captions)
+        self._log_text_input_batch(captions)
+
+        target_device = next(self.llm_adapter.parameters()).device
+        if next(self.llm_model.model.parameters()).device != target_device:
+            self.llm_model.model.to(target_device)
+        with torch.set_grad_enabled(self.train_llm):
+            jina_outputs = self.llm_model(captions)
+        inputs = self._build_model_inputs(jina_outputs)
+
+        if not self._conditioning_finite_check_complete:
+            failures = [
+                summary
+                for name, tensor in inputs.items()
+                if name != "attention_mask"
+                for summary in (_nonfinite_tensor_summary(name, tensor),)
+                if summary is not None
+            ]
+            if failures:
+                raise FloatingPointError(
+                    "Non-finite Jina encoder output detected before the adapter. " + " | ".join(failures)
+                )
+
+        prompt_embeds, pooled_embeds = self.llm_adapter(**inputs)
+        if not self._conditioning_finite_check_complete:
+            failures = [
+                summary
+                for summary in (
+                    _nonfinite_tensor_summary("adapter_prompt_embeds", prompt_embeds),
+                    _nonfinite_tensor_summary("adapter_pooled_embeds", pooled_embeds),
+                )
+                if summary is not None
+            ]
+            if failures:
+                raise FloatingPointError(
+                    "Jina encoder outputs were finite, but the adapter produced non-finite conditioning. "
+                    + " | ".join(failures)
+                )
+            self._conditioning_finite_check_complete = True
+
+        if return_attention_mask:
+            return prompt_embeds, pooled_embeds, inputs["attention_mask"]
+        return prompt_embeds, pooled_embeds
+
+
+def configure_jina_v3_new_modules_only(model):
+    """Freeze the inherited V2 sequence path and train only V3's redesigned modules."""
+    if not isinstance(model, JinaToSDXLAdapterV3):
+        raise ValueError("--train_jina_v3_new_modules_only requires --jina_adapter_version v3.")
+    model.requires_grad_(False)
+    model.layer_fusion.requires_grad_(True)
+    model.mean_pooled_projection.requires_grad_(True)
+    return model
+
+
+def load_jina_tokenizer(args):
+    return load_jina_clip_tokenizer(
+        args.llm_model_path,
+        revision=getattr(args, "llm_model_revision", None),
+    )
+
+
+def load_jina_and_adapter(args, train_adapter=False):
+    """Load Jina CLIP v2 plus a V2 or redesigned V3 SDXL text adapter."""
+    if not args.llm_model_path:
+        raise ValueError("--llm_model_path is required for Jina CLIP v2 conditioning.")
+    if args.max_token_length is None or int(args.max_token_length) <= 0:
+        raise ValueError("Jina conditioning requires a positive explicit --max_token_length (for example 512 or 1024).")
+
+    adapter_version = getattr(args, "jina_adapter_version", "v2")
+    use_v3_adapter = adapter_version == "v3"
+    required_hidden_state_layers = (
+        JinaToSDXLAdapterV3.required_hidden_state_layers if use_v3_adapter else None
+    )
+    train_jina = bool(getattr(args, "train_jina_clip_layers", False))
+    jina_model = JinaStates(
+        model_id=args.llm_model_path,
+        device="cpu",
+        dtype=torch.bfloat16,
+        max_length=int(args.max_token_length),
+        custom_train_jina=train_jina,
+        init_add_artist_tag=bool(getattr(args, "init_artist_special_token", False)),
+        keep_vision_model=False,
+        num_hidden_state_layers=1,
+        hidden_state_layer_indices=required_hidden_state_layers,
+        revision=getattr(args, "llm_model_revision", None),
+        code_revision=getattr(args, "llm_code_revision", None),
+    )
+    if getattr(args, "gradient_checkpointing_jina", False):
+        jina_model.model.gradient_checkpointing_enable()
+
+    adapter_kwargs = {
+        "llm_dim": 1024,
+        "sdxl_seq_dim": 2048,
+        "sdxl_pooled_dim": 1280,
+        "n_attention_blocks": 4,
+        "num_heads": 16,
+        "dropout": 0,
+        "max_seq_len": math.ceil(int(args.max_token_length) / 77) * 77,
+    }
+    if use_v3_adapter:
+        adapter = JinaToSDXLAdapterV3(
+            **adapter_kwargs,
+            layer_mix_init=getattr(args, "jina_layer_mix_init", "uniform"),
+        )
+        adapter_label = "JinaToSDXLAdapterV3"
+    else:
+        adapter = JinaToSDXLAdapterV2(**adapter_kwargs)
+        adapter_label = "JinaToSDXLAdapterV2"
+
+    checkpoint_path = getattr(args, "llm_adapter_path", None)
+    checkpoint_state = None
+    if checkpoint_path:
+        checkpoint_state = load_file(checkpoint_path, device="cpu")
+        if getattr(args, "adapter_not_mha", False):
+            checkpoint_state = convert_state_dict_for_explicit_attention(checkpoint_state)
+    elif not (use_v3_adapter and train_adapter):
+        raise ValueError(
+            "--llm_adapter_path is required for Jina adapter V2 and whenever the adapter is frozen."
+        )
+
+    if checkpoint_state is not None:
+        if use_v3_adapter:
+            incomplete = missing_or_mismatched_v3_keys(adapter, checkpoint_state)
+            if not train_adapter and incomplete:
+                raise ValueError(
+                    "A frozen Jina V3 adapter requires a complete redesigned V3 checkpoint. Missing or "
+                    f"incompatible tensors include: {', '.join(incomplete[:8])}"
+                )
+            if getattr(args, "train_jina_v3_new_modules_only", False):
+                target_state = adapter.state_dict()
+                shared_keys = [
+                    key
+                    for key in target_state
+                    if key.startswith("seq_projection.") or key.startswith("attention_blocks.")
+                ]
+                missing_shared = [
+                    key
+                    for key in shared_keys
+                    if key not in checkpoint_state
+                    or tuple(checkpoint_state[key].shape) != tuple(target_state[key].shape)
+                ]
+                if missing_shared:
+                    raise ValueError(
+                        "--train_jina_v3_new_modules_only requires all V2-compatible sequence weights. "
+                        f"Missing or incompatible tensors include: {', '.join(missing_shared[:8])}"
+                    )
+            compatible, unexpected, shape_mismatches = filter_compatible_adapter_state_dict(
+                adapter,
+                checkpoint_state,
+            )
+            load_state_dict_with_report(adapter, compatible, adapter_label, strict=False)
+            if unexpected or shape_mismatches:
+                logger.warning(
+                    "%s ignored %d checkpoint-only keys and %d shape mismatches.",
+                    adapter_label,
+                    len(unexpected),
+                    len(shape_mismatches),
+                )
+        else:
+            load_state_dict_with_report(adapter, checkpoint_state, adapter_label, strict=False)
+
+    adapter.requires_grad_(bool(train_adapter))
+    adapter.train(bool(train_adapter))
+    if getattr(args, "train_jina_v3_new_modules_only", False):
+        configure_jina_v3_new_modules_only(adapter)
+
+    return JinaAndAdapter(
+        llm_model=jina_model,
+        tokenizer=jina_model.tokenizer,
+        llm_adapter=adapter,
+        should_train_llm=train_jina,
+        log_text_inputs=getattr(args, "log_jina_text_inputs", False),
+        log_text_input_batches=getattr(args, "log_jina_text_input_batches", 1),
+        log_text_input_max_chars=getattr(args, "log_jina_text_input_max_chars", 4000),
+    )
+
+
+def prepare_jina_adapter_cross_attention_mask(args, text_encoder_conds, text_embedding, device):
+    if not (
+        getattr(args, "adapter_jina", False)
+        and getattr(args, "jina_adapter_cross_attn_mask", False)
+    ):
+        return None
+    attention_mask = text_encoder_conds.get("attention_mask")
+    if attention_mask is None:
+        raise ValueError("--jina_adapter_cross_attn_mask requires a Jina attention_mask.")
+    if attention_mask.dim() > 2:
+        attention_mask = attention_mask.squeeze(0)
+    if attention_mask.dim() != 2:
+        raise ValueError(f"Jina attention_mask must be [B, L], got {tuple(attention_mask.shape)}")
+    if tuple(attention_mask.shape) != tuple(text_embedding.shape[:2]):
+        raise ValueError(
+            "Jina attention_mask shape must match the text embedding: "
+            f"mask={tuple(attention_mask.shape)}, embedding={tuple(text_embedding.shape)}"
+        )
+    return attention_mask.to(device=device, dtype=torch.bool)
 
 
 def _unet_block_index_from_name(name: str) -> int:
@@ -176,6 +561,45 @@ def train(args):
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
 
+    use_jina = bool(args.use_llm_as_text_encoder and args.adapter_jina)
+    if bool(args.use_llm_as_text_encoder) != bool(args.adapter_jina):
+        raise ValueError("Jina conditioning requires both --use_llm_as_text_encoder and --adapter_jina.")
+    if args.jina_adapter_cross_attn_mask and not use_jina:
+        raise ValueError("--jina_adapter_cross_attn_mask requires Jina conditioning.")
+    if use_jina and args.jina_adapter_cross_attn_mask and args.xformers:
+        raise ValueError(
+            "--jina_adapter_cross_attn_mask is not supported by the native xFormers attention path; "
+            "use --sdpa, --mem_eff_attn, or eager attention."
+        )
+    if use_jina and args.cache_text_encoder_outputs:
+        raise ValueError(
+            "--cache_text_encoder_outputs is not supported with Jina conditioning; "
+            "Jina re-encodes the processed batch captions each step."
+        )
+    if use_jina and args.train_text_encoder:
+        raise ValueError("Use --train_jina_clip_layers instead of --train_text_encoder with Jina conditioning.")
+
+    adapter_learning_rate = args.adapter_learning_rate
+    if adapter_learning_rate is not None and (
+        not math.isfinite(float(adapter_learning_rate)) or float(adapter_learning_rate) < 0.0
+    ):
+        raise ValueError("--adapter_learning_rate must be finite and non-negative.")
+    train_adapter = use_jina and adapter_learning_rate is not None and float(adapter_learning_rate) > 0.0
+    train_jina_clip = use_jina and bool(args.train_jina_clip_layers)
+    if train_jina_clip and args.deepspeed:
+        raise ValueError("--train_jina_clip_layers is not supported with DeepSpeed in this port.")
+    if args.train_jina_v3_new_modules_only:
+        if not use_jina or args.jina_adapter_version != "v3":
+            raise ValueError("--train_jina_v3_new_modules_only requires Jina adapter V3.")
+        if not train_adapter:
+            raise ValueError("--train_jina_v3_new_modules_only requires a positive --adapter_learning_rate.")
+        if not args.llm_adapter_path:
+            raise ValueError("--train_jina_v3_new_modules_only requires --llm_adapter_path for a V2/V3 warm start.")
+    if train_jina_clip and (
+        not math.isfinite(float(args.jina_clip_learning_rate)) or float(args.jina_clip_learning_rate) <= 0.0
+    ):
+        raise ValueError("--jina_clip_learning_rate must be finite and greater than zero.")
+
     assert (
         not args.weighted_captions
     ), "weighted_captions is not supported currently / weighted_captionsは現在サポートされていません"
@@ -241,6 +665,8 @@ def train(args):
             args.v_pred_like_loss = None
         if args.flow_use_ot:
             logger.info("Using cosine optimal transport pairing for Rectified Flow batches.")
+        if getattr(args, "flow_continuous_timesteps", False):
+            logger.info("Using exact continuous (non-quantized) Rectified Flow timestep conditioning.")
         shift_enabled = args.flow_uniform_shift or args.flow_uniform_static_ratio is not None
         if args.flow_timestep_distribution == "logit_normal":
             if args.flow_logit_std <= 0:
@@ -364,6 +790,15 @@ def train(args):
     logger.info("prepare accelerator")
     accelerator = train_util.prepare_accelerator(args)
 
+    def unwrap_optional_model(model):
+        return None if model is None else accelerator.unwrap_model(model)
+
+    if train_jina_clip and accelerator.num_processes > 1:
+        raise ValueError(
+            "--train_jina_clip_layers is currently limited to one process in this port; "
+            "the adapter itself supports distributed training."
+        )
+
     # mixed precisionに対応した型を用意しておき適宜castする
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
     vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
@@ -384,7 +819,8 @@ def train(args):
         accelerator.device,
         weight_dtype,
         custom_vae_type=getattr(args, "vae_type", None),
-        latent_channels_override=getattr(args, "latent_channels", None)
+        latent_channels_override=getattr(args, "latent_channels", None),
+        load_text_encoders=not use_jina,
     )
     load_stable_diffusion_format = os.path.isfile(args.pretrained_model_name_or_path)
 
@@ -495,8 +931,11 @@ def train(args):
     train_unet = args.learning_rate != 0
     train_text_encoder1 = False
     train_text_encoder2 = False
+    a_text_encoder = None
 
-    if args.train_text_encoder:
+    if use_jina:
+        a_text_encoder = load_jina_and_adapter(args, train_adapter=train_adapter)
+    elif args.train_text_encoder:
         # TODO each option for two text encoders?
         accelerator.print("enable text encoder training")
         if args.gradient_checkpointing:
@@ -541,7 +980,12 @@ def train(args):
     if not cache_latents:
         vae.requires_grad_(False)
         vae.eval()
-        vae.to(accelerator.device, dtype=vae_dtype)
+        custom_sdxl_utils.move_custom_vae_to_device(
+            vae,
+            accelerator.device,
+            vae_dtype,
+            getattr(args, "vae_type", None),
+        )
 
     unet.requires_grad_(train_unet)
     if train_unet and frozen_unet_blocks:
@@ -566,6 +1010,29 @@ def train(args):
     if train_text_encoder2:
         training_models.append(text_encoder2)
         params_to_optimize.append({"params": list(text_encoder2.parameters()), "lr": args.learning_rate_te2 or args.learning_rate})
+    if train_adapter:
+        trainable_adapter_parameters = [
+            parameter for parameter in a_text_encoder.llm_adapter.parameters() if parameter.requires_grad
+        ]
+        if not trainable_adapter_parameters:
+            raise RuntimeError("Jina adapter training was requested, but no adapter parameters are trainable.")
+        training_models.append(a_text_encoder.llm_adapter)
+        params_to_optimize.append(
+            {"params": trainable_adapter_parameters, "lr": float(adapter_learning_rate)}
+        )
+    if train_jina_clip:
+        trainable_jina_parameters = [
+            parameter for parameter in a_text_encoder.llm_model.model.parameters() if parameter.requires_grad
+        ]
+        if not trainable_jina_parameters:
+            raise RuntimeError("--train_jina_clip_layers did not expose any trainable Jina parameters.")
+        training_models.append(a_text_encoder.llm_model.model)
+        params_to_optimize.append(
+            {"params": trainable_jina_parameters, "lr": float(args.jina_clip_learning_rate)}
+        )
+
+    if not training_models:
+        raise ValueError("Nothing is trainable: set a positive U-Net, adapter, or Jina CLIP learning rate.")
 
     # calculate number of trainable parameters
     n_params = 0
@@ -573,7 +1040,10 @@ def train(args):
         for p in group["params"]:
             n_params += p.numel()
 
-    accelerator.print(f"train unet: {train_unet}, text_encoder1: {train_text_encoder1}, text_encoder2: {train_text_encoder2}")
+    accelerator.print(
+        f"train unet: {train_unet}, Jina adapter: {train_adapter}, Jina CLIP: {train_jina_clip}, "
+        f"text_encoder1: {train_text_encoder1}, text_encoder2: {train_text_encoder2}"
+    )
     accelerator.print(f"number of models: {len(training_models)}")
     accelerator.print(f"number of trainable parameters: {n_params}")
 
@@ -669,21 +1139,27 @@ def train(args):
         ), "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
         accelerator.print("enable full fp16 training.")
         unet.to(weight_dtype)
-        text_encoder1.to(weight_dtype)
-        text_encoder2.to(weight_dtype)
+        if not use_jina:
+            text_encoder1.to(weight_dtype)
+            text_encoder2.to(weight_dtype)
     elif args.full_bf16:
         assert (
             args.mixed_precision == "bf16"
         ), "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
         accelerator.print("enable full bf16 training.")
         unet.to(weight_dtype)
-        text_encoder1.to(weight_dtype)
-        text_encoder2.to(weight_dtype)
+        if not use_jina:
+            text_encoder1.to(weight_dtype)
+            text_encoder2.to(weight_dtype)
 
     # freeze last layer and final_layer_norm in te1 since we use the output of the penultimate layer
     if train_text_encoder1:
         text_encoder1.text_model.encoder.layers[-1].requires_grad_(False)
         text_encoder1.text_model.final_layer_norm.requires_grad_(False)
+
+    if use_jina:
+        a_text_encoder.llm_adapter.to(accelerator.device, dtype=torch.float32)
+        a_text_encoder.llm_model.model.to(accelerator.device, dtype=torch.bfloat16)
 
     if args.deepspeed:
         ds_model = deepspeed_utils.prepare_deepspeed_model(
@@ -691,6 +1167,8 @@ def train(args):
             unet=unet if train_unet else None,
             text_encoder1=text_encoder1 if train_text_encoder1 else None,
             text_encoder2=text_encoder2 if train_text_encoder2 else None,
+            llm_adapter=a_text_encoder.llm_adapter if train_adapter else None,
+            jina_model=a_text_encoder.llm_model.model if train_jina_clip else None,
         )
         # most of ZeRO stage uses optimizer partitioning, so we have to prepare optimizer and ds_model at the same time. # pull/1139#issuecomment-1986790007
         ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -706,6 +1184,13 @@ def train(args):
             text_encoder1 = accelerator.prepare(text_encoder1)
         if train_text_encoder2:
             text_encoder2 = accelerator.prepare(text_encoder2)
+        if train_adapter:
+            old_adapter = a_text_encoder.llm_adapter
+            a_text_encoder.llm_adapter = accelerator.prepare(old_adapter)
+            training_models = [
+                a_text_encoder.llm_adapter if model is old_adapter else model
+                for model in training_models
+            ]
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     # TextEncoderの出力をキャッシュするときにはCPUへ移動する
@@ -714,6 +1199,9 @@ def train(args):
         text_encoder1.to("cpu", dtype=torch.float32)
         text_encoder2.to("cpu", dtype=torch.float32)
         clean_memory_on_device(accelerator.device)
+    elif use_jina:
+        a_text_encoder.llm_adapter.to(accelerator.device, dtype=torch.float32)
+        a_text_encoder.llm_model.model.to(accelerator.device, dtype=torch.bfloat16)
     else:
         # make sure Text Encoders are on GPU
         text_encoder1.to(accelerator.device)
@@ -838,10 +1326,26 @@ def train(args):
             init_kwargs=init_kwargs,
         )
 
+    def sample_images_if_supported(sample_accelerator, epoch_no, step_no):
+        # The stock sampler constructs CLIP conditioning. Jina conditioning is
+        # intentionally skipped until a sampler with the same adapter/mask
+        # boundary is supplied.
+        if use_jina:
+            return
+        sdxl_train_util.sample_images(
+            sample_accelerator,
+            args,
+            epoch_no,
+            step_no,
+            sample_accelerator.device,
+            vae,
+            [tokenizer1, tokenizer2],
+            [text_encoder1, text_encoder2],
+            unet,
+        )
+
     # For --sample_at_first
-    sdxl_train_util.sample_images(
-        accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet
-    )
+    sample_images_if_supported(accelerator, 0, global_step)
 
     loss_recorder = train_util.LossRecorder()
 
@@ -881,7 +1385,24 @@ def train(args):
                     latents = latents - args.vae_shift_factor
                 latents = latents * args.vae_scale_factor
 
-                if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
+                if use_jina:
+                    device_type = accelerator.device.type
+                    autocast_disabled = (
+                        torch.amp.autocast(device_type=device_type, enabled=False)
+                        if device_type in ("cuda", "cpu", "xpu", "mps")
+                        else torch.no_grad() if not (train_adapter or train_jina_clip) else torch.enable_grad()
+                    )
+                    with torch.set_grad_enabled(train_adapter or train_jina_clip), autocast_disabled:
+                        prompt_embeds, pooled_prompt_embeds, attention_mask = a_text_encoder(
+                            batch["captions"],
+                            return_attention_mask=True,
+                        )
+                    text_encoder_conds = {
+                        "prompt_embeds": prompt_embeds,
+                        "pooled_prompt_embeds": pooled_prompt_embeds,
+                        "attention_mask": attention_mask,
+                    }
+                elif "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
                     input_ids1 = batch["input_ids"]
                     input_ids2 = batch["input_ids2"]
                     with torch.set_grad_enabled(args.train_text_encoder):
@@ -941,8 +1462,22 @@ def train(args):
                 embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
 
                 # concat embeddings
-                vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+                if use_jina:
+                    text_embedding = text_encoder_conds["prompt_embeds"].to(weight_dtype)
+                    vector_embedding = torch.cat(
+                        [text_encoder_conds["pooled_prompt_embeds"], embs],
+                        dim=1,
+                    ).to(weight_dtype)
+                    cross_attention_mask = prepare_jina_adapter_cross_attention_mask(
+                        args,
+                        text_encoder_conds,
+                        text_embedding,
+                        accelerator.device,
+                    )
+                else:
+                    vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+                    text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+                    cross_attention_mask = None
 
                 needs_dynamic_shift = (
                     args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
@@ -966,7 +1501,13 @@ def train(args):
 
                 # Predict the noise residual
                 with accelerator.autocast():
-                    noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
+                    noise_pred = unet(
+                        noisy_latents,
+                        timesteps,
+                        text_embedding,
+                        vector_embedding,
+                        cross_attention_mask=cross_attention_mask,
+                    )
 
                 if args.flow_model:
                     target = noise - latents
@@ -1090,17 +1631,7 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                sdxl_train_util.sample_images(
-                    accelerator,
-                    args,
-                    None,
-                    global_step,
-                    accelerator.device,
-                    vae,
-                    [tokenizer1, tokenizer2],
-                    [text_encoder1, text_encoder2],
-                    unet,
-                )
+                sample_images_if_supported(accelerator, None, global_step)
 
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
@@ -1118,13 +1649,27 @@ def train(args):
                             epoch,
                             num_train_epochs,
                             global_step,
-                            accelerator.unwrap_model(text_encoder1),
-                            accelerator.unwrap_model(text_encoder2),
+                            unwrap_optional_model(text_encoder1),
+                            unwrap_optional_model(text_encoder2),
                             accelerator.unwrap_model(unet),
                             vae,
                             logit_scale,
                             ckpt_info,
                         )
+
+                        if use_jina and train_adapter:
+                            save_llm_adapter(
+                                accelerator.unwrap_model(a_text_encoder.llm_adapter),
+                                args.output_dir,
+                                f"step-{global_step:07d}",
+                            )
+                        if train_jina_clip:
+                            save_jina_clip(
+                                accelerator,
+                                a_text_encoder.llm_model,
+                                args.output_dir,
+                                f"step-{global_step:07d}",
+                            )
 
                         if args.edm2_loss_weighting:
                             loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step, "_edm2_loss_weights")
@@ -1193,13 +1738,28 @@ def train(args):
                     epoch,
                     num_train_epochs,
                     global_step,
-                    accelerator.unwrap_model(text_encoder1),
-                    accelerator.unwrap_model(text_encoder2),
+                    unwrap_optional_model(text_encoder1),
+                    unwrap_optional_model(text_encoder2),
                     accelerator.unwrap_model(unet),
                     vae,
                     logit_scale,
                     ckpt_info,
                 )
+
+                if (epoch + 1) % args.save_every_n_epochs == 0:
+                    if use_jina and train_adapter:
+                        save_llm_adapter(
+                            accelerator.unwrap_model(a_text_encoder.llm_adapter),
+                            args.output_dir,
+                            f"epoch-{epoch + 1:04d}",
+                        )
+                    if train_jina_clip:
+                        save_jina_clip(
+                            accelerator,
+                            a_text_encoder.llm_model,
+                            args.output_dir,
+                            f"epoch-{epoch + 1:04d}",
+                        )
 
                 if args.edm2_loss_weighting:
                     if (epoch + 1) % args.save_every_n_epochs == 0:
@@ -1215,23 +1775,16 @@ def train(args):
                             if os.path.exists(remove_loss_weights_file):
                                 os.remove(remove_loss_weights_file)
 
-        sdxl_train_util.sample_images(
-            accelerator,
-            args,
-            epoch + 1,
-            global_step,
-            accelerator.device,
-            vae,
-            [tokenizer1, tokenizer2],
-            [text_encoder1, text_encoder2],
-            unet,
-        )
+        sample_images_if_supported(accelerator, epoch + 1, global_step)
 
     is_main_process = accelerator.is_main_process
     # if is_main_process:
     unet = accelerator.unwrap_model(unet)
-    text_encoder1 = accelerator.unwrap_model(text_encoder1)
-    text_encoder2 = accelerator.unwrap_model(text_encoder2)
+    text_encoder1 = unwrap_optional_model(text_encoder1)
+    text_encoder2 = unwrap_optional_model(text_encoder2)
+    if use_jina:
+        final_llm_adapter = accelerator.unwrap_model(a_text_encoder.llm_adapter)
+        final_jina_model = accelerator.unwrap_model(a_text_encoder.llm_model.model)
 
     accelerator.end_training()
 
@@ -1259,6 +1812,14 @@ def train(args):
         )
         logger.info("model saved.")
 
+        if use_jina and train_adapter:
+            save_llm_adapter(final_llm_adapter, args.output_dir, "final")
+        if train_jina_clip:
+            jina_output_path = os.path.join(args.output_dir, "jina_final")
+            final_jina_model.save_pretrained(jina_output_path, safe_serialization=True)
+            a_text_encoder.llm_model.tokenizer.save_pretrained(jina_output_path)
+            logger.info("Saved fine-tuned Jina CLIP: %s", jina_output_path)
+
         if args.edm2_loss_weighting:
             loss_weights_ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as, "_edm2_loss_weights")
             loss_weights_file = os.path.join(args.output_dir, loss_weights_ckpt_name)
@@ -1280,6 +1841,106 @@ def setup_parser() -> argparse.ArgumentParser:
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
     sdxl_train_util.add_sdxl_training_arguments(parser)
+
+    parser.add_argument(
+        "--use_llm_as_text_encoder",
+        action="store_true",
+        help="Use Jina CLIP v2 plus a Jina-to-SDXL adapter for text conditioning.",
+    )
+    parser.add_argument(
+        "--adapter_jina",
+        action="store_true",
+        help="Select the Jina CLIP v2 text-conditioning path.",
+    )
+    parser.add_argument(
+        "--llm_model_path",
+        type=str,
+        default=None,
+        help="Hugging Face ID or local directory for jina-clip-v2.",
+    )
+    parser.add_argument(
+        "--llm_model_revision",
+        type=str,
+        default=None,
+        help="Optional pinned revision for Jina model/config/tokenizer assets.",
+    )
+    parser.add_argument(
+        "--llm_code_revision",
+        type=str,
+        default=None,
+        help="Optional pinned revision for Jina trusted remote architecture code.",
+    )
+    parser.add_argument(
+        "--llm_adapter_path",
+        type=str,
+        default=None,
+        help="Path to a standalone Jina-to-SDXL adapter safetensors file.",
+    )
+    parser.add_argument(
+        "--adapter_learning_rate",
+        type=float,
+        default=None,
+        help="Learning rate for all trainable Jina adapter parameters. Omit or set 0 to freeze it.",
+    )
+    parser.add_argument(
+        "--adapter_not_mha",
+        action="store_true",
+        help="Legacy checkpoint uses fused nn.MultiheadAttention in_proj keys and must be converted to explicit q/k/v keys.",
+    )
+    parser.add_argument(
+        "--jina_adapter_version",
+        choices=["v2", "v3"],
+        default="v2",
+        help="Jina-to-SDXL adapter architecture version.",
+    )
+    parser.add_argument(
+        "--jina_layer_mix_init",
+        choices=["uniform", "final"],
+        default="uniform",
+        help="Deprecated V3 compatibility option; V3 always uses a zero-gated h24 residual.",
+    )
+    parser.add_argument(
+        "--train_jina_v3_new_modules_only",
+        action="store_true",
+        help=(
+            "Freeze V3's inherited V2 sequence path and train only layer_fusion plus "
+            "mean_pooled_projection at --adapter_learning_rate."
+        ),
+    )
+    parser.add_argument(
+        "--jina_adapter_cross_attn_mask",
+        action="store_true",
+        help="Pass Jina's valid-token mask into the native SDXL U-Net cross-attention.",
+    )
+    parser.add_argument(
+        "--train_jina_clip_layers",
+        action="store_true",
+        help="Fine-tune Jina text embeddings, its final two text layers, and text_projection.",
+    )
+    parser.add_argument(
+        "--jina_clip_learning_rate",
+        type=float,
+        default=2e-6,
+        help="Learning rate for the selectively unfrozen Jina CLIP parameters.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing_jina",
+        action="store_true",
+        help="Enable gradient checkpointing in Jina's trusted remote model.",
+    )
+    parser.add_argument(
+        "--init_artist_special_token",
+        action="store_true",
+        help="Add and initialize the legacy <artist> tokenizer token.",
+    )
+    parser.add_argument(
+        "--should_train_llm_encode",
+        action="store_true",
+        help="Deprecated compatibility flag; use --train_jina_clip_layers to unfreeze Jina.",
+    )
+    parser.add_argument("--log_jina_text_inputs", action="store_true", help="Log initial Jina caption/token summaries.")
+    parser.add_argument("--log_jina_text_input_batches", type=int, default=1)
+    parser.add_argument("--log_jina_text_input_max_chars", type=int, default=4000)
 
     parser.add_argument(
         "--learning_rate_te1",
@@ -1364,6 +2025,11 @@ def setup_parser() -> argparse.ArgumentParser:
         "--flow_use_ot",
         action="store_true",
         help="pair latents and noise with cosine optimal transport when using Rectified Flow / Rectified Flow使用時にOTでlatentとノイズを対応付ける",
+    )
+    parser.add_argument(
+        "--flow_continuous_timesteps",
+        action="store_true",
+        help="condition Rectified Flow on the exact non-quantized timestep used to construct the noisy latent",
     )
     parser.add_argument(
         "--flow_timestep_distribution",

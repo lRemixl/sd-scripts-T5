@@ -61,6 +61,7 @@ def add_config_arguments(parser: argparse.ArgumentParser):
 class BaseSubsetParams:
     image_dir: Optional[str] = None
     num_repeats: int = 1
+    artist_balance_repeats: Union[bool, int] = False
     shuffle_caption: bool = False
     caption_separator: str = (",",)
     keep_tokens: int = 0
@@ -76,6 +77,7 @@ class BaseSubsetParams:
     caption_dropout_rate: float = 0.0
     caption_dropout_every_n_epochs: int = 0
     caption_tag_dropout_rate: float = 0.0
+    artist_tag_dropout_rate: float = 0.0
     token_warmup_min: int = 1
     token_warmup_step: float = 0
 
@@ -189,6 +191,7 @@ class ConfigSanitizer:
         "face_crop_aug_range": functools.partial(__validate_and_convert_twodim.__func__, float),
         "flip_aug": bool,
         "num_repeats": int,
+        "artist_balance_repeats": Any(bool, int),
         "random_crop": bool,
         "shuffle_caption": bool,
         "keep_tokens": int,
@@ -206,6 +209,7 @@ class ConfigSanitizer:
         "caption_dropout_every_n_epochs": int,
         "caption_dropout_rate": Any(float, int),
         "caption_tag_dropout_rate": Any(float, int),
+        "artist_tag_dropout_rate": Any(float, int),
     }
     # DB means DreamBooth
     DB_SUBSET_ASCENDABLE_SCHEMA = {
@@ -527,6 +531,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
           image_dir: "{subset.image_dir}"
           image_count: {subset.img_count}
           num_repeats: {subset.num_repeats}
+          artist_balance_repeats: {subset.artist_balance_repeats}
           shuffle_caption: {subset.shuffle_caption}
           keep_tokens: {subset.keep_tokens}
           keep_tokens_separator: {subset.keep_tokens_separator}
@@ -536,6 +541,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
           caption_dropout_rate: {subset.caption_dropout_rate}
           caption_dropout_every_n_epoches: {subset.caption_dropout_every_n_epochs}
           caption_tag_dropout_rate: {subset.caption_tag_dropout_rate}
+          artist_tag_dropout_rate: {subset.artist_tag_dropout_rate}
           caption_prefix: {subset.caption_prefix}
           caption_suffix: {subset.caption_suffix}
           color_aug: {subset.color_aug}

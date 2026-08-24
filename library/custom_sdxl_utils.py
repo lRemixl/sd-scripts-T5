@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 from torch import nn
-from diffusers import AutoencoderKL, AutoencoderDC, AutoencoderKLFlux2
+from diffusers import AutoencoderKL
 from library import model_util, train_util
 from tqdm import tqdm
 from PIL import Image
@@ -21,7 +21,57 @@ from library.train_util import (
     is_disk_cached_latents_is_expected,
 )
 
-def load_custom_sdxl_checkpoint(ckpt_path, map_location, dtype=None, custom_vae_type=None, latent_channels_override=None):
+def load_sdxl_text_encoders_from_checkpoint(state_dict, map_location, load_text_encoders=True):
+    """Load the two standard SDXL CLIP towers, or omit them for external conditioning."""
+    if not load_text_encoders:
+        print("[Custom Loader] Skipping SDXL CLIP-L/CLIP-G; external text conditioning is active.")
+        return None, None, None
+
+    print("building text encoders")
+    text_model1_cfg = CLIPTextConfig(
+        vocab_size=49408, hidden_size=768, intermediate_size=3072, num_hidden_layers=12, num_attention_heads=12,
+        max_position_embeddings=77, hidden_act="quick_gelu", layer_norm_eps=1e-05, dropout=0.0, attention_dropout=0.0,
+        initializer_range=0.02, initializer_factor=1.0, pad_token_id=1, bos_token_id=0, eos_token_id=2,
+        model_type="clip_text_model", projection_dim=768
+    )
+    with init_empty_weights():
+        text_model1 = CLIPTextModel._from_config(text_model1_cfg)
+
+    text_model2_cfg = CLIPTextConfig(
+        vocab_size=49408, hidden_size=1280, intermediate_size=5120, num_hidden_layers=32, num_attention_heads=20,
+        max_position_embeddings=77, hidden_act="gelu", layer_norm_eps=1e-05, dropout=0.0, attention_dropout=0.0,
+        initializer_range=0.02, initializer_factor=1.0, pad_token_id=1, bos_token_id=0, eos_token_id=2,
+        model_type="clip_text_model", projection_dim=1280
+    )
+    with init_empty_weights():
+        text_model2 = CLIPTextModelWithProjection(text_model2_cfg)
+
+    print("loading text encoders from checkpoint")
+    te1_sd = {}
+    te2_sd = {}
+    for key in list(state_dict.keys()):
+        if key.startswith("conditioner.embedders.0.transformer."):
+            te1_sd[key.replace("conditioner.embedders.0.transformer.", "")] = state_dict.pop(key)
+        elif key.startswith("conditioner.embedders.1.model."):
+            te2_sd[key] = state_dict.pop(key)
+
+    if "text_model.embeddings.position_ids" in te1_sd:
+        te1_sd.pop("text_model.embeddings.position_ids")
+
+    _load_state_dict_on_device(text_model1, te1_sd, device=map_location)
+    converted_sd, logit_scale = convert_sdxl_text_encoder_2_checkpoint(te2_sd, max_length=77)
+    _load_state_dict_on_device(text_model2, converted_sd, device=map_location)
+    return text_model1, text_model2, logit_scale
+
+
+def load_custom_sdxl_checkpoint(
+    ckpt_path,
+    map_location,
+    dtype=None,
+    custom_vae_type=None,
+    latent_channels_override=None,
+    load_text_encoders=True,
+):
     """
     Custom loader that inspects checkpoint to determine if UNet needs patching BEFORE loading weights.
     Crucial for resuming training with modified UNet (16/32 channels).
@@ -107,43 +157,13 @@ def load_custom_sdxl_checkpoint(ckpt_path, map_location, dtype=None, custom_vae_
         # 2. Patch (expand)
         unet = patch_unet_for_latent_channels(unet, target_channels)
     
-    # 6. Load Text Encoders (Standard SDXL logic)
-    print("building text encoders")
-    # TE1
-    text_model1_cfg = CLIPTextConfig(
-        vocab_size=49408, hidden_size=768, intermediate_size=3072, num_hidden_layers=12, num_attention_heads=12,
-        max_position_embeddings=77, hidden_act="quick_gelu", layer_norm_eps=1e-05, dropout=0.0, attention_dropout=0.0,
-        initializer_range=0.02, initializer_factor=1.0, pad_token_id=1, bos_token_id=0, eos_token_id=2,
-        model_type="clip_text_model", projection_dim=768
+    # 6. Standard CLIP towers are optional when Jina plus its adapter supplies
+    # all SDXL text conditioning.
+    text_model1, text_model2, logit_scale = load_sdxl_text_encoders_from_checkpoint(
+        state_dict,
+        map_location,
+        load_text_encoders=load_text_encoders,
     )
-    with init_empty_weights():
-        text_model1 = CLIPTextModel._from_config(text_model1_cfg)
-    
-    # TE2
-    text_model2_cfg = CLIPTextConfig(
-        vocab_size=49408, hidden_size=1280, intermediate_size=5120, num_hidden_layers=32, num_attention_heads=20,
-        max_position_embeddings=77, hidden_act="gelu", layer_norm_eps=1e-05, dropout=0.0, attention_dropout=0.0,
-        initializer_range=0.02, initializer_factor=1.0, pad_token_id=1, bos_token_id=0, eos_token_id=2,
-        model_type="clip_text_model", projection_dim=1280
-    )
-    with init_empty_weights():
-        text_model2 = CLIPTextModelWithProjection(text_model2_cfg)
-
-    print("loading text encoders from checkpoint")
-    te1_sd = {}
-    te2_sd = {}
-    for k in list(state_dict.keys()):
-        if k.startswith("conditioner.embedders.0.transformer."):
-            te1_sd[k.replace("conditioner.embedders.0.transformer.", "")] = state_dict.pop(k)
-        elif k.startswith("conditioner.embedders.1.model."):
-            te2_sd[k] = state_dict.pop(k)
-
-    if "text_model.embeddings.position_ids" in te1_sd:
-        te1_sd.pop("text_model.embeddings.position_ids")
-
-    _load_state_dict_on_device(text_model1, te1_sd, device=map_location)
-    converted_sd, logit_scale = convert_sdxl_text_encoder_2_checkpoint(te2_sd, max_length=77)
-    _load_state_dict_on_device(text_model2, converted_sd, device=map_location)
 
     # 7. Load VAE
     # We load standard VAE from checkpoint first, then user can replace it later if args.vae_type is set
@@ -291,7 +311,57 @@ def patch_unet_for_latent_channels(unet, latent_channels=16):
     print(f"[Model Loader] Patched UNet for {latent_channels}-channel latents.")
     return unet
 
+
+def normalize_vae_type(value):
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("-", "_")
+    return {
+        "flux2_vae": "flux2",
+        "flux_2": "flux2",
+        "flux_vae": "flux",
+        "sdxl_vae": "sdxl",
+    }.get(text, text)
+
+
+def is_flux2_vae_type(value):
+    return normalize_vae_type(value) == "flux2"
+
+
+def move_custom_vae_to_device(vae, device, dtype, vae_type):
+    """Move a custom VAE without destroying Diffusers' mixed-dtype policy."""
+    if is_flux2_vae_type(vae_type):
+        # AutoencoderKLFlux2 receives its compute dtype in from_pretrained().
+        # Casting the whole module again would also cast its protected fp32
+        # layers, defeating Diffusers' load-time policy.
+        vae.to(device=device)
+    else:
+        vae.to(device=device, dtype=dtype)
+    return vae
+
+
+def _load_autoencoder_kl_flux2_cls():
+    try:
+        from diffusers import AutoencoderKLFlux2
+    except ImportError as exc:
+        raise ImportError(
+            "Flux2 VAE support requires a Diffusers version that exposes AutoencoderKLFlux2."
+        ) from exc
+    return AutoencoderKLFlux2
+
+
+def _load_autoencoder_dc_cls():
+    try:
+        from diffusers import AutoencoderDC
+    except ImportError as exc:
+        raise ImportError(
+            "Sana/DC-AE VAE support requires a Diffusers version that exposes AutoencoderDC."
+        ) from exc
+    return AutoencoderDC
+
+
 def load_custom_vae(vae_path, vae_type, dtype, device):
+    vae_type = normalize_vae_type(vae_type)
     if vae_path == 'sdxl_vae':
         vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
     elif vae_path == 'flux_vae' or (vae_type == 'flux' and vae_path is None):
@@ -302,11 +372,13 @@ def load_custom_vae(vae_path, vae_type, dtype, device):
         )
     elif vae_path == 'sana_vae' or (vae_type == 'sana' and vae_path is None):
         print("[Model Loader] Loading Sana VAE from 'mit-han-lab/dc-ae-f32c32-sana-1.0-diffusers'.")
+        AutoencoderDC = _load_autoencoder_dc_cls()
         vae = AutoencoderDC.from_pretrained(
             "mit-han-lab/dc-ae-f32c32-sana-1.0-diffusers"
         )
     elif vae_path == 'flux2_vae' or (vae_type == 'flux2' and vae_path is None):
         print("[Model Loader] Loading Flux2 VAE from 'black-forest-labs/FLUX.2-dev'.")
+        AutoencoderKLFlux2 = _load_autoencoder_kl_flux2_cls()
         vae = AutoencoderKLFlux2.from_pretrained(
             "black-forest-labs/FLUX.2-dev",
             subfolder="vae",
@@ -331,12 +403,12 @@ def load_custom_vae(vae_path, vae_type, dtype, device):
                 print(f"  Loading via from_pretrained (subfolder={subfolder})...")
                 try:
                     if vae_type == 'flux2':
+                        AutoencoderKLFlux2 = _load_autoencoder_kl_flux2_cls()
                         vae = AutoencoderKLFlux2.from_pretrained(vae_path, subfolder=subfolder, torch_dtype=dtype)
                     else:
                         vae = AutoencoderKL.from_pretrained(vae_path, subfolder=subfolder)
-                        
-                    vae.to(device, dtype=dtype)
-                    return vae
+
+                    return move_custom_vae_to_device(vae, device, dtype, vae_type)
                 except Exception as e:
                     print(f"  Error loading from directory: {e}")
                     raise e
@@ -344,6 +416,7 @@ def load_custom_vae(vae_path, vae_type, dtype, device):
             # If it's a file, we proceed with weight loading logic
             # Initialize appropriate class
             if vae_type == 'flux2':
+                 AutoencoderKLFlux2 = _load_autoencoder_kl_flux2_cls()
                  # Fallback strategy for single file: 
                  # 1. Try to find config.json in same dir as file (or parent dir)
                  # 2. Try to load PRETRAINED structure from HuggingFace
@@ -397,8 +470,7 @@ def load_custom_vae(vae_path, vae_type, dtype, device):
              # Standard LDM-compatible VAE or unknown
              vae = model_util.load_vae(vae_path, dtype)
     
-    vae.to(device, dtype=dtype)
-    return vae
+    return move_custom_vae_to_device(vae, device, dtype, vae_type)
 
 def normalize_latents(latents, mu, sigma):
     mu = mu.view(1, -1, 1, 1).to(latents.device)
@@ -482,7 +554,12 @@ def cache_latents_custom(
                 and self.random_crop == other.random_crop
             )
 
-    images_to_process.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
+    images_to_process.sort(
+        key=lambda info: train_util.latent_cache_batch_sort_key(
+            info,
+            image_to_subset[info.image_key],
+        )
+    )
     batches = []
     batch = []
     current_condition = None
@@ -504,7 +581,7 @@ def cache_latents_custom(
         batches.append((current_condition, batch))
 
     vae.eval()
-    vae.to(device, dtype=cache_vae_dtype)
+    move_custom_vae_to_device(vae, device, cache_vae_dtype, vae_type)
 
     for condition, batch_infos in tqdm(batches, desc="Caching Custom Latents"):
         images = []
